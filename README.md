@@ -61,16 +61,9 @@ API Endpoints
   - 仅返回能查到 symbol 的 ERC20 代币
   - Response: {"window": {"from":"...","to":"..."}, "tokens":[{"token_address":"0x..","name":"","symbol":"","decimals":18,"total_supply":"...","txs_count":123}]}
 
-- GET /tokens/{token}/txs/hourly?from=ISO&to=ISO
-  - token 为 ERC20 合约地址（0x 开头 42 字符）
-  - 查询参数 from/to 支持 Unix 时间戳（秒或毫秒）或 RFC3339 字符串；建议使用时间戳
-    - 例：`from=1726617600&to=1726646400`（秒）或 `from=1726617600000&to=1726646400000`（毫秒）
-    - 为空时默认：`to=now`，`from=to-24h`
-  - Response: {"token_address":"0x..","from":"...","to":"...","points":[{"hour":"...","txs_count":12}]}
-
 - GET /tokens/{token}/txs/8h
   - 直接返回最近 8 小时的每小时桶（来自 token_transfer_8hour_points）
-  - Response: {"token_address":"0x..","from":"...","to":"...","points":[{"hour":"...","txs_count":12}]}
+  - Response: {"token_address":"0x..","points":[{"hour":"...","txs_count":12}]}
 
 - GET /tokens/{token}/metadata
   Response: {"token_address":"0x..","name":"","symbol":"","decimals":18,"total_supply":"...","first_seen_block":0,"updated_at":"..."}

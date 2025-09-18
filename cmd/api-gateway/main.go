@@ -28,6 +28,8 @@ func main() {
     h := &api.Handler{Store: pg, Cache: rds, LeaderboardSize: cfg.LeaderboardSize}
     mux := http.NewServeMux()
     h.Routes(mux)
+    // Serve static frontend from ./web (index + token pages)
+    mux.Handle("/", http.FileServer(http.Dir("web")))
 
     srv := &http.Server{Addr: cfg.Addr, Handler: mux}
 
@@ -41,4 +43,3 @@ func main() {
         log.Fatalf("server error: %v", err)
     }
 }
-

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Top Tokens · 8h</title>
+<link rel="stylesheet" href="/style.css"/>
+<body>
+  <div class="container">
+    <h1 class="title">8h Token Hotness</h1>
+    <div id="window" class="meta"></div>
+    <div class="header">
+      <div class="rank">#</div>
+      <div class="left">Token</div>
+      <div class="col" style="flex:1"></div>
+      <div class="col" style="width:110px;text-align:right">TXs (8h)</div>
+    </div>
+    <div id="list" class="list"></div>
+    <div class="footer">Data window: last 8 hours · Updated periodically</div>
+  </div>
+  <script>
+  const fmt = new Intl.NumberFormat('en', { maximumFractionDigits: 0 });
+  async function loadTop(){
+    const res = await fetch('/tokens/top?limit=100');
+    if(!res.ok){ document.getElementById('list').textContent='Failed to load'; return }
+    const data = await res.json();
+    const items = data.tokens||[];
+    const max = items.length? items[0].txs_count : 0;
+    const wrap = document.getElementById('list');
+    wrap.innerHTML='';
+    document.getElementById('window').textContent = data.window? `Window: ${new Date(data.window.from).toLocaleString()} — ${new Date(data.window.to).toLocaleString()}` : '';
+    items.forEach((it, idx) => {
+      const el = document.createElement('a');
+      el.className='card';
+      el.href = `/token.html?address=${encodeURIComponent(it.token_address)}`;
+      const pct = max>0? Math.max(2, Math.round(it.txs_count/max*100)) : 0;
+      const rclass = idx===0? 'top1' : idx===1? 'top2' : idx===2? 'top3' : '';
+      el.innerHTML = `
+        <div class="rank ${rclass}">${idx+1}</div>
+        <div class="left" style="min-width:220px">
+          <div class="symbol">${escapeHtml(it.symbol||'')} <span class="meta">${escapeHtml(it.name||'')}</span></div>
+          <div class="addr">${it.token_address}</div>
+        </div>
+        <div class="hotbar"><div class="bar" style="width:${pct}%"></div></div>
+        <div class="count"><div class="num">${fmt.format(it.txs_count)}</div></div>
+      `;
+      wrap.appendChild(el);
+    });
+  }
+  function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])) }
+  loadTop();
+  setInterval(loadTop, 60_000);
+  </script>
+</body>
+</html>

@@ -54,12 +54,8 @@ func (h *Handler) TopTokens(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) tokenSubroutes(w http.ResponseWriter, r *http.Request) {
-    // Expect: /tokens/{token}/txs/hourly
+    // Expect: /tokens/{token}/txs/8h
     parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-    if len(parts) == 4 && parts[0] == "tokens" && parts[2] == "txs" && parts[3] == "hourly" {
-        h.HourlySeries(w, r, parts[1])
-        return
-    }
     if len(parts) == 4 && parts[0] == "tokens" && parts[2] == "txs" && parts[3] == "8h" {
         h.Series8h(w, r, parts[1])
         return
@@ -71,22 +67,6 @@ func (h *Handler) tokenSubroutes(w http.ResponseWriter, r *http.Request) {
     http.NotFound(w, r)
 }
 
-func (h *Handler) HourlySeries(w http.ResponseWriter, r *http.Request, token string) {
-    ctx := r.Context()
-    from, to := parseWindow(r, 24*time.Hour)
-    pts, err := h.Store.HourlySeries(ctx, token, from, to)
-    if err != nil {
-        httpError(w, http.StatusInternalServerError, err)
-        return
-    }
-    writeJSON(w, http.StatusOK, map[string]any{
-        "token_address": token,
-        "from": from,
-        "to": to,
-        "points": pts,
-    })
-}
-
 // GET /tokens/{token}/txs/8h
 func (h *Handler) Series8h(w http.ResponseWriter, r *http.Request, token string) {
     ctx := r.Context()
@@ -95,16 +75,8 @@ func (h *Handler) Series8h(w http.ResponseWriter, r *http.Request, token string)
         httpError(w, http.StatusInternalServerError, err)
         return
     }
-    // derive time window from series if present
-    var from, to time.Time
-    if len(pts) > 0 {
-        from = pts[0].Hour
-        to = pts[len(pts)-1].Hour
-    }
     writeJSON(w, http.StatusOK, map[string]any{
         "token_address": token,
-        "from": from,
-        "to": to,
         "points": pts,
     })
 }

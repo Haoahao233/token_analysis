@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Token · 8h</title>
+<link rel="stylesheet" href="/style.css"/>
+<body>
+  <div class="container">
+    <a href="/" class="link">← Back</a>
+    <h1 class="title" id="title">Token</h1>
+    <div class="stat" id="stat"></div>
+    <div class="chart">
+      <svg id="svg" viewBox="0 0 800 200" preserveAspectRatio="none"></svg>
+    </div>
+    <div class="meta" id="win"></div>
+  </div>
+  <script>
+  const params = new URLSearchParams(location.search);
+  const address = (params.get('address')||'').toLowerCase();
+  if(!address){ document.getElementById('title').textContent='Missing token address'; }
+
+  function humanSupply(total, decimals){
+    try{
+      if(!total) return '';
+      const d = Number(decimals||0);
+      if(d<=0) return total;
+      const s = total.toString();
+      const pad = s.length<=d? '0'.repeat(d - s.length + 1) + s : s;
+      const i = pad.length - d;
+      let out = pad.slice(0, i) + '.' + pad.slice(i);
+      out = out.replace(/\.0+$/,'').replace(/(\..*?)0+$/,'$1');
+      return out;
+    }catch(e){ return total }
+  }
+
+  async function load(){
+    // metadata
+    const mres = await fetch(`/tokens/${address}/metadata`);
+    const md = mres.ok? await mres.json() : {};
+    const name = md.name||''; const sym = md.symbol||''; const dec = md.decimals||0; const sup = md.total_supply||'';
+    document.getElementById('title').textContent = `${sym||'Unknown'} ${name? '· '+name: ''}`;
+    document.getElementById('stat').innerHTML = `
+      <a class="badge ext" href="https://etherscan.io/token/${address}" target="_blank" rel="noopener" title="Open on Etherscan">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3h7v7h-2V6.41l-9.29 9.3-1.42-1.42 9.3-9.29H14V3zM5 5h6v2H7v10h10v-4h2v6H5V5z"/></svg>
+        <span>${address}</span>
+      </a>
+      <span class="badge">decimals: ${dec}</span>
+      <span class="badge">supply: ${humanSupply(sup, dec)}</span>
+    `;
+
+    // 8h points
+    const sres = await fetch(`/tokens/${address}/txs/8h`);
+    if(!sres.ok){ document.getElementById('win').textContent='Failed to load series'; return }
+    const sdata = await sres.json();
+    const pts = sdata.points||[];
+    draw(pts);
+  }
+
+  function draw(points){
+    const svg = document.getElementById('svg');
+    const NS='http://www.w3.org/2000/svg';
+    svg.innerHTML='';
+    if(!points.length){ svg.innerHTML='<text x="10" y="20" fill="#9bb0c9">No data</text>'; return }
+    const w=800, h=220, padL=40, padB=24, padT=10, padR=10;
+    const innerW = w - padL - padR;
+    const innerH = h - padT - padB;
+    const maxYraw = Math.max(...points.map(p=>p.txs_count), 1);
+    const yStep = niceStep(maxYraw/4);
+    const maxY = Math.ceil(maxYraw / yStep) * yStep;
+    const xs = points.map((_,i)=> padL + i*( innerW/Math.max(1, points.length-1) ));
+    const ys = points.map(p=> padT + (1 - (p.txs_count/maxY)) * innerH);
+
+    // axes
+    const axisColor = '#203046';
+    const ax = document.createElementNS(NS,'line'); ax.setAttribute('x1', padL); ax.setAttribute('y1', padT); ax.setAttribute('x2', padL); ax.setAttribute('y2', h-padB); ax.setAttribute('stroke', axisColor); svg.appendChild(ax);
+    const bx = document.createElementNS(NS,'line'); bx.setAttribute('x1', padL); bx.setAttribute('y1', h-padB); bx.setAttribute('x2', w-padR); bx.setAttribute('y2', h-padB); bx.setAttribute('stroke', axisColor); svg.appendChild(bx);
+    // y ticks
+    for(let v=0; v<=maxY; v+=yStep){
+      const y = padT + (1 - v/maxY) * innerH;
+      const t = document.createElementNS(NS,'text'); t.setAttribute('x', padL-6); t.setAttribute('y', y+3); t.setAttribute('fill','#9bb0c9'); t.setAttribute('font-size','10'); t.setAttribute('text-anchor','end'); t.textContent = v;
+      svg.appendChild(t);
+      const gl = document.createElementNS(NS,'line'); gl.setAttribute('x1', padL); gl.setAttribute('y1', y); gl.setAttribute('x2', w-padR); gl.setAttribute('y2', y); gl.setAttribute('stroke', '#142033'); gl.setAttribute('stroke-dasharray','2,4'); svg.appendChild(gl);
+    }
+
+    // line
+    const poly = xs.map((x,i)=> x+","+ys[i]).join(' ');
+    const pl = document.createElementNS(NS,'polyline');
+    pl.setAttribute('points', poly);
+    pl.setAttribute('fill','none');
+    pl.setAttribute('stroke','#4ea1ff');
+    pl.setAttribute('stroke-width','2');
+    svg.appendChild(pl);
+
+    // dots
+    const dots=[];
+    for(let i=0;i<xs.length;i++){
+      const c = document.createElementNS(NS,'circle');
+      c.setAttribute('cx', xs[i]); c.setAttribute('cy', ys[i]); c.setAttribute('r','3'); c.setAttribute('fill','#34d399');
+      svg.appendChild(c); dots.push(c);
+    }
+    // x labels (hours)
+    const fmtHour = (s)=> new Date(s).toLocaleTimeString([], {hour:'2-digit'});
+    for(let i=0;i<points.length;i++){
+      const t = document.createElementNS(NS,'text');
+      t.setAttribute('x', xs[i]); t.setAttribute('y', h-6); t.setAttribute('fill','#9bb0c9'); t.setAttribute('font-size','10'); t.setAttribute('text-anchor','middle');
+      t.textContent = fmtHour(points[i].hour);
+      svg.appendChild(t);
+    }
+
+    // tooltip overlay
+    const vline = document.createElementNS(NS,'line'); vline.setAttribute('y1', padT); vline.setAttribute('y2', h-padB); vline.setAttribute('stroke','#2b4e7a'); vline.setAttribute('stroke-dasharray','4,4'); vline.style.display='none'; svg.appendChild(vline);
+    const hi = document.createElementNS(NS,'circle'); hi.setAttribute('r','5'); hi.setAttribute('fill','#ffd166'); hi.style.display='none'; svg.appendChild(hi);
+    const tipBg = document.createElementNS(NS,'rect'); tipBg.setAttribute('rx','4'); tipBg.setAttribute('ry','4'); tipBg.setAttribute('fill','#0e1520'); tipBg.setAttribute('stroke','#203046'); tipBg.style.display='none'; svg.appendChild(tipBg);
+    const tipTx = document.createElementNS(NS,'text'); tipTx.setAttribute('fill','#e6eef8'); tipTx.setAttribute('font-size','11'); tipTx.style.display='none'; svg.appendChild(tipTx);
+
+    function nearestIndex(x){
+      let best=0, d=1e9; for(let i=0;i<xs.length;i++){ const di=Math.abs(xs[i]-x); if(di<d){d=di; best=i} }
+      return best;
+    }
+    function showAt(i){
+      const x=xs[i], y=ys[i];
+      vline.setAttribute('x1', x); vline.setAttribute('x2', x); vline.style.display='';
+      hi.setAttribute('cx', x); hi.setAttribute('cy', y); hi.style.display='';
+      const d = points[i].txs_count; const ts = new Date(points[i].hour).toLocaleString();
+      tipTx.textContent = `${ts} · ${d}`;
+      const ty = Math.max(padT+12, Math.min(y-10, h-padB-6));
+      tipTx.setAttribute('y', ty); tipTx.setAttribute('x', x+8); tipTx.style.display='';
+      let bb = tipTx.getBBox();
+      // clamp horizontally if overflow on the right; if so, place to the left of the point
+      let left = x+8;
+      const rightBound = w - padR - 2; // inside chart
+      if (left + bb.width + 8 > rightBound) {
+        left = Math.max(padL+2, x - 8 - bb.width);
+        tipTx.setAttribute('x', left);
+        bb = tipTx.getBBox();
+      }
+      tipBg.setAttribute('x', bb.x-4); tipBg.setAttribute('y', bb.y-2); tipBg.setAttribute('width', bb.width+8); tipBg.setAttribute('height', bb.height+4); tipBg.style.display='';
+    }
+    function hideTip(){ vline.style.display='none'; hi.style.display='none'; tipTx.style.display='none'; tipBg.style.display='none'; }
+    function toLocalX(evt){ const rect=svg.getBoundingClientRect(); const px = evt.clientX - rect.left; const ratio = w/rect.width; return px*ratio }
+    svg.addEventListener('mousemove', (e)=>{ const x = toLocalX(e); const i = nearestIndex(x); showAt(i) });
+    svg.addEventListener('mouseleave', hideTip);
+  }
+
+  function niceStep(x){
+    const pow = Math.pow(10, Math.floor(Math.log10(x||1)));
+    const base = x/pow;
+    let step;
+    if(base<=1) step=1; else if(base<=2) step=2; else if(base<=5) step=5; else step=10;
+    return step*pow;
+  }
+
+  load();
+  </script>
+</body>
+</html>
