@@ -62,7 +62,6 @@ type Worker struct {
     LeaderboardInterval time.Duration
     LeaderboardSize int
     RPCURL string
-    MetadataRetryInterval time.Duration
     ProgressLogInterval time.Duration
 }
 
@@ -76,7 +75,6 @@ func LoadWorker() Worker {
         LeaderboardInterval: getenvDur("LEADERBOARD_INTERVAL", 60*time.Second),
         LeaderboardSize: getenvInt("LEADERBOARD_SIZE", 100),
         RPCURL: getenv("RPC_URL", "http://127.0.0.1:8545"),
-        MetadataRetryInterval: getenvDur("METADATA_RETRY_INTERVAL", time.Hour),
         ProgressLogInterval: getenvDur("PROGRESS_LOG_INTERVAL", 15*time.Second),
     }
 }

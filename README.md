@@ -40,7 +40,6 @@ Worker (analysis-worker)
 - LEADERBOARD_INTERVAL: default 60s
 - LEADERBOARD_SIZE: default 100
 - RPC_URL: default http://127.0.0.1:8545 (用于补齐缺失的 ERC20 元数据)
-- METADATA_RETRY_INTERVAL: default 1h（元数据抓取失败后的重试间隔，避免反复触发revert）
 - PROGRESS_LOG_INTERVAL: default 15s（进度日志打印间隔）
 
 API (api-gateway)

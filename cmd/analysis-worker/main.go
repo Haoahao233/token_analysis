@@ -10,7 +10,6 @@ import (
     "github.com/example/tx-analytics/internal/aggregator"
     "github.com/example/tx-analytics/internal/cache"
     "github.com/example/tx-analytics/internal/config"
-    "github.com/example/tx-analytics/internal/eth"
     "github.com/example/tx-analytics/internal/store"
 )
 
@@ -35,11 +34,9 @@ func main() {
         IdleDelay: cfg.IdleDelay,
         LeaderboardInterval: cfg.LeaderboardInterval,
         LeaderboardSize: cfg.LeaderboardSize,
-        MetaRetryInterval: cfg.MetadataRetryInterval,
         ProgressInterval: cfg.ProgressLogInterval,
     }
 
-    w.ERC20 = eth.NewERC20Client(cfg.RPCURL)
 
     if err := w.Run(ctx); err != nil && err != context.Canceled {
         log.Printf("worker stopped: %v", err)

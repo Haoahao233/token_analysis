@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/example/tx-analytics/internal/cache"
-	"github.com/example/tx-analytics/internal/eth"
 	"github.com/example/tx-analytics/internal/store"
 )
 
@@ -21,12 +20,6 @@ type Worker struct {
 	LeaderboardInterval time.Duration
 	LeaderboardSize     int
 
-	ERC20 *eth.ERC20Client
-
-	// avoid hammering problematic tokens repeatedly
-	MetaRetryInterval time.Duration
-	lastMetaAttempt   map[string]time.Time
-
 	// progress logging
 	ProgressInterval time.Duration
 }
@@ -37,9 +30,6 @@ func (w *Worker) Run(ctx context.Context) error {
 	defer ticker.Stop()
 	progTicker := time.NewTicker(w.ProgressInterval)
 	defer progTicker.Stop()
-	if w.lastMetaAttempt == nil {
-		w.lastMetaAttempt = make(map[string]time.Time)
-	}
 	started := time.Now()
 	var totalProcessed int64
 	var processedSinceReport int64
@@ -66,8 +56,8 @@ func (w *Worker) Run(ctx context.Context) error {
 			continue
 		}
 
-		// No safe blocks to finalize yet
-		if lastB >= safe {
+		// No safe blocks to finalize yet (allow same safe block to continue by log_index)
+		if lastB > safe {
 			log.Printf("idle: checkpoint at safe (cp=%d:%d safe=%d latest=%d); waiting %s", lastB, lastIdx, safe, latest, w.IdleDelay)
 			select {
 			case <-ticker.C:
