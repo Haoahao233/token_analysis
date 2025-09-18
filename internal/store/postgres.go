@@ -434,7 +434,18 @@ func (p *Postgres) Series8h(ctx context.Context, token string) ([]models.HourPoi
 // AggregateHourlyNextBatch groups the next N safe rows server-side and upserts hourly counts, returning the new checkpoint and processed row count.
 func (p *Postgres) AggregateHourlyNextBatch(ctx context.Context, lastBlock, lastLogIdx, maxBlock int64, limit int) (int64, int64, int64, error) {
     var newB, newIdx, processed int64
-    err := p.pool.QueryRow(ctx, `
+    tx, err := p.pool.Begin(ctx)
+    if err != nil { return 0, 0, 0, err }
+    defer func() { _ = tx.Rollback(ctx) }()
+    // increase work_mem for better GROUP BY performance on large batches
+    if _, err := tx.Exec(ctx, `SET LOCAL work_mem = '128MB'`); err != nil {
+        return 0, 0, 0, err
+    }
+    // since aggregates are reproducible, we can relax durability for speed
+    if _, err := tx.Exec(ctx, `SET LOCAL synchronous_commit = 'off'`); err != nil {
+        return 0, 0, 0, err
+    }
+    err = tx.QueryRow(ctx, `
         WITH next AS (
             SELECT token_address, block_timestamp, block_number, log_index
             FROM token_transfers
@@ -463,5 +474,6 @@ func (p *Postgres) AggregateHourlyNextBatch(ctx context.Context, lastBlock, last
                (SELECT COUNT(*) FROM next) AS processed
     `, lastBlock, lastLogIdx, maxBlock, limit).Scan(&newB, &newIdx, &processed)
     if err != nil { return 0, 0, 0, err }
+    if err := tx.Commit(ctx); err != nil { return 0, 0, 0, err }
     return newB, newIdx, processed, nil
 }

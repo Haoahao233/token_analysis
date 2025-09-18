@@ -68,9 +68,11 @@ func (w *Worker) Run(ctx context.Context) error {
 
 		// No safe blocks to finalize yet
 		if lastB >= safe {
+			log.Printf("idle: checkpoint at safe (cp=%d:%d safe=%d latest=%d); waiting %s", lastB, lastIdx, safe, latest, w.IdleDelay)
 			select {
 			case <-ticker.C:
 				w.roll8h(ctx)
+				w.refreshLeaderboard(ctx)
 			default:
 			}
 			time.Sleep(w.IdleDelay)
@@ -86,6 +88,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 		pullMs := time.Since(t0).Milliseconds()
 		if processed == 0 {
+			log.Printf("no-rows: within safe bound (cp=%d:%d safe=%d latest=%d); sleeping %s", lastB, lastIdx, safe, latest, w.IdleDelay)
 			select {
 			case <-ticker.C:
 				w.roll8h(ctx)
