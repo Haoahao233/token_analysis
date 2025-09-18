@@ -390,7 +390,7 @@ func (p *Postgres) Rebuild8hAtHour(ctx context.Context, hour time.Time) error {
         INSERT INTO token_transfer_8hour (token_address, txs_count, updated_at)
         SELECT token_address, SUM(txs_count) AS s, NOW()
         FROM token_transfer_hourly
-        WHERE hour >= $1 - INTERVAL '7 hours' AND hour <= $1
+        WHERE hour BETWEEN ($1::timestamp - INTERVAL '7 hours') AND ($1::timestamp)
         GROUP BY token_address
     `, h)
     return err
