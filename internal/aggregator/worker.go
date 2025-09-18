@@ -106,54 +106,7 @@ func (w *Worker) Run(ctx context.Context) error {
             }
         }
         // note: server-side aggregation path doesn't expose per-token min block here.
-        // For metadata ensure/enrich, we can fetch distinct tokens in the batch if needed via a separate small query later.
-        if w.ERC20 != nil {
-            // TODO: optional token set discovery per batch if enriching metadata is required at scale.
-            // Skipped here to keep the hot path fast.
-        }
-                // backoff repeated failures
-                if t, ok := w.lastMetaAttempt[token]; ok && time.Since(t) < w.MetaRetryInterval {
-                    continue
-                }
-                w.lastMetaAttempt[token] = time.Now()
-
-                // preflight: ensure it's a contract address
-                cctx, cancelCode := context.WithTimeout(ctx, 3*time.Second)
-                code, errCode := w.ERC20.GetCode(cctx, token)
-                cancelCode()
-                if errCode == nil && (code == "0x" || code == "0x0") {
-                    continue
-                }
-                // read current metadata; if missing name/symbol/decimals, try to fetch
-                md, err := w.Store.GetTokenMetadata(ctx, token)
-                if err != nil || md.Name == "" || md.Symbol == "" || md.Decimals == 0 || md.TotalSupply == "" {
-                    // short timeout per token
-                    cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-                    name, sym, tsStr := md.Name, md.Symbol, md.TotalSupply
-                    if name == "" { if v, err := w.ERC20.Name(cctx, token); err == nil { name = v } }
-                    if sym == "" { if v, err := w.ERC20.Symbol(cctx, token); err == nil { sym = v } }
-                    var dec uint8
-                    if md.Decimals == 0 { if v, err := w.ERC20.Decimals(cctx, token); err == nil { dec = v } else { dec = 0 } } else { dec = uint8(md.Decimals) }
-                    if tsStr == "" { if v, err := w.ERC20.TotalSupply(cctx, token); err == nil { tsStr = v.String() } }
-                    cancel()
-                    upd := models.TokenMetadata{
-                        TokenAddress: token,
-                        Name: name,
-                        Symbol: sym,
-                        Decimals: int32(dec),
-                        TotalSupply: tsStr,
-                        FirstSeenBlock: md.FirstSeenBlock,
-                        UpdatedAt: time.Now().UTC(),
-                    }
-                    // Only upsert if at least one field is non-empty
-                    if name != "" || sym != "" || dec != 0 || tsStr != "" {
-                        if err := w.Store.UpsertTokenMetadata(ctx, upd); err != nil {
-                            log.Printf("UpsertTokenMetadata %s error: %v", token, err)
-                        }
-                    }
-                }
-            }
-        }
+        // If you need metadata enrichment on the hot path, we can add a lightweight distinct-token query.
 
         select {
         case <-ticker.C:
