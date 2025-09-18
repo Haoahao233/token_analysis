@@ -109,6 +109,8 @@ func (w *Worker) Run(ctx context.Context) error {
 				log.Printf("SetCheckpoint error: %v", err)
 			}
 		}
+		// try to advance 8h window after each batch
+		w.roll8h(ctx)
 		// note: server-side aggregation path doesn't expose per-token min block here.
 		// If you need metadata enrichment on the hot path, we can add a lightweight distinct-token query.
 
@@ -191,10 +193,17 @@ func (w *Worker) roll8h(ctx context.Context) {
 	}
 	if cur.IsZero() {
 		// initialize to processed hour snapshot
-		if err := w.Store.Rebuild8hAtHour(ctx, procHour); err == nil {
-			log.Printf("8h init at hour=%s", procHour.Format(time.RFC3339))
-			_ = w.Store.Set8hCursorHour(ctx, procHour)
+		if err := w.Store.Rebuild8hAtHour(ctx, procHour); err != nil {
+			log.Printf("8h init failed at hour=%s: %v", procHour.Format(time.RFC3339), err)
+			return
 		}
+		// seed points for the last 8 hours [procHour-7h, procHour]
+		for d := 7; d >= 0; d-- {
+			h := procHour.Add(-time.Duration(d) * time.Hour)
+			_ = w.Store.Add8hPointsHour(ctx, h)
+		}
+		_ = w.Store.Set8hCursorHour(ctx, procHour)
+		log.Printf("8h init at hour=%s (points seeded)", procHour.Format(time.RFC3339))
 		return
 	}
 	// advance hour by hour up to safeHour
