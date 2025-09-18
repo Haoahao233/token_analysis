@@ -76,12 +76,14 @@ func (w *Worker) Run(ctx context.Context) error {
             continue
         }
 
-        rows, err := w.Store.NextTransfers(ctx, lastB, lastIdx, w.BatchSize)
+        t0 := time.Now()
+        rows, err := w.Store.NextTransfersSafe(ctx, lastB, lastIdx, safe, w.BatchSize)
         if err != nil {
             log.Printf("NextTransfers error: %v", err)
             time.Sleep(w.IdleDelay)
             continue
         }
+        pullMs := time.Since(t0).Milliseconds()
         if len(rows) == 0 {
             select {
             case <-ticker.C:
@@ -91,24 +93,40 @@ func (w *Worker) Run(ctx context.Context) error {
             time.Sleep(w.IdleDelay)
             continue
         }
+        log.Printf("pull: rows=%d in %dms (cp=%d:%d safe=%d)", len(rows), pullMs, lastB, lastIdx, safe)
 
         var maxB, maxIdx int64
         // track minimal first seen block per token in this batch
         minBlockByToken := map[string]int64{}
+        // aggregate hourly increments to batch-upsert
+        aggTokens := make([]string, 0, len(rows))
+        aggHours := make([]time.Time, 0, len(rows))
+        aggCounts := make([]int64, 0, len(rows))
+        // use a map to group duplicates within the batch
+        type key struct{ token string; hour time.Time }
+        inc := make(map[key]int64)
         for _, r := range rows {
-            if r.BlockNumber > safe { // don't finalize unsafe
-                break
-            }
-            if err := w.Store.UpsertHourly(ctx, r.TokenAddress, r.BlockTimestamp); err != nil {
-                log.Printf("UpsertHourly error: %v", err)
-                break
-            }
+            h := r.BlockTimestamp.Truncate(time.Hour)
+            inc[key{token: r.TokenAddress, hour: h}]++
             if mb, ok := minBlockByToken[r.TokenAddress]; !ok || r.BlockNumber < mb {
                 minBlockByToken[r.TokenAddress] = r.BlockNumber
             }
             maxB, maxIdx = r.BlockNumber, r.LogIndex
             totalProcessed++
             processedSinceReport++
+        }
+        // flush batch upsert
+        if len(inc) > 0 {
+            t1 := time.Now()
+            for k, v := range inc {
+                aggTokens = append(aggTokens, k.token)
+                aggHours = append(aggHours, k.hour)
+                aggCounts = append(aggCounts, v)
+            }
+            if err := w.Store.UpsertHourlyBatch(ctx, aggTokens, aggHours, aggCounts); err != nil {
+                log.Printf("UpsertHourlyBatch error: %v", err)
+            }
+            log.Printf("upsert-hourly: keys=%d in %dms", len(aggTokens), time.Since(t1).Milliseconds())
         }
         if maxB > 0 {
             if err := w.Store.SetCheckpoint(ctx, w.WorkerID, maxB, maxIdx); err != nil {
@@ -216,24 +234,28 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) roll8h(ctx context.Context) {
-    // compute safe hour based on chain tip
+    // anchor to the latest processed hour (not ahead of safe)
     latest, err := w.Store.LatestBlockNumber(ctx)
     if err != nil { return }
     safe := latest - w.ReorgDepth
     safeHour, err := w.Store.LatestSafeHour(ctx, safe)
     if err != nil || safeHour.IsZero() { return }
+    procHour, err := w.Store.LatestProcessedHour(ctx)
+    if err != nil || procHour.IsZero() { return }
+    if procHour.After(safeHour) { procHour = safeHour }
 
     cur, err := w.Store.Get8hCursorHour(ctx)
     if err != nil { return }
     if cur.IsZero() {
-        // initialize to safe hour snapshot
-        if err := w.Store.Rebuild8hAtHour(ctx, safeHour); err == nil {
-            _ = w.Store.Set8hCursorHour(ctx, safeHour)
+        // initialize to processed hour snapshot
+        if err := w.Store.Rebuild8hAtHour(ctx, procHour); err == nil {
+            log.Printf("8h init at hour=%s", procHour.Format(time.RFC3339))
+            _ = w.Store.Set8hCursorHour(ctx, procHour)
         }
         return
     }
     // advance hour by hour up to safeHour
-    for h := cur.Add(time.Hour); !h.After(safeHour); h = h.Add(time.Hour) {
+    for h := cur.Add(time.Hour); !h.After(procHour); h = h.Add(time.Hour) {
         // add new hour into points and summary
         if err := w.Store.Add8hPointsHour(ctx, h); err != nil { break }
         if err := w.Store.Add8hHour(ctx, h); err != nil { break }
@@ -242,6 +264,7 @@ func (w *Worker) roll8h(ctx context.Context) {
         if err := w.Store.Sub8hHour(ctx, out); err != nil { break }
         _ = w.Store.Sub8hPointsHour(ctx, out)
         _ = w.Store.Set8hCursorHour(ctx, h)
+        log.Printf("8h rolled to hour=%s (dropped=%s)", h.Format(time.RFC3339), out.Format(time.RFC3339))
     }
 }
 

@@ -58,6 +58,32 @@ func (m *MockStore) SetCheckpoint(ctx context.Context, workerID string, lastBloc
 
 func (m *MockStore) LatestBlockNumber(ctx context.Context) (int64, error) { return m.LatestBlk, nil }
 
+func (m *MockStore) LatestProcessedHour(ctx context.Context) (time.Time, error) {
+    var max int64 = 0
+    for k := range m.HourAgg {
+        // k format: token|unixHour
+        parts := 0
+        for i := len(k)-1; i >= 0; i-- {
+            if k[i] == '|' { parts = i; break }
+        }
+        if parts <= 0 { continue }
+        // parse int64
+        var n int64 = 0
+        sign := int64(1)
+        s := k[parts+1:]
+        for i := 0; i < len(s); i++ {
+            c := s[i]
+            if c == '-' && i == 0 { sign = -1; continue }
+            if c < '0' || c > '9' { n = 0; break }
+            n = n*10 + int64(c-'0')
+        }
+        n *= sign
+        if n > max { max = n }
+    }
+    if max == 0 { return time.Time{}, nil }
+    return time.Unix(max, 0).UTC(), nil
+}
+
 func (m *MockStore) NextTransfers(ctx context.Context, lastBlock, lastLogIdx int64, limit int) ([]models.TransferRow, error) {
     // ensure sorted
     trs := make([]models.TransferRow, len(m.Transfers))
@@ -78,9 +104,35 @@ func (m *MockStore) NextTransfers(ctx context.Context, lastBlock, lastLogIdx int
     return out, nil
 }
 
+func (m *MockStore) NextTransfersSafe(ctx context.Context, lastBlock, lastLogIdx int64, maxBlock int64, limit int) ([]models.TransferRow, error) {
+    trs := make([]models.TransferRow, len(m.Transfers))
+    copy(trs, m.Transfers)
+    sort.Slice(trs, func(i, j int) bool {
+        if trs[i].BlockNumber == trs[j].BlockNumber { return trs[i].LogIndex < trs[j].LogIndex }
+        return trs[i].BlockNumber < trs[j].BlockNumber
+    })
+    var out []models.TransferRow
+    for _, t := range trs {
+        if t.BlockNumber > maxBlock { break }
+        if t.BlockNumber > lastBlock || (t.BlockNumber == lastBlock && t.LogIndex > lastLogIdx) {
+            out = append(out, t)
+            if len(out) >= limit { break }
+        }
+    }
+    return out, nil
+}
+
 func (m *MockStore) UpsertHourly(ctx context.Context, token string, ts time.Time) error {
     k := m.key(token, ts)
     m.HourAgg[k]++
+    return nil
+}
+
+func (m *MockStore) UpsertHourlyBatch(ctx context.Context, tokens []string, hours []time.Time, counts []int64) error {
+    for i := range tokens {
+        k := m.key(tokens[i], hours[i])
+        m.HourAgg[k] += counts[i]
+    }
     return nil
 }
 

@@ -25,6 +25,8 @@ Run migrations in Postgres before starting services:
 
   psql "$PG_DSN" -f migrations/001_init.sql
   psql "$PG_DSN" -f migrations/003_token_transfer_8hour.sql
+  psql "$PG_DSN" -f migrations/004_token_transfer_8hour_points.sql
+  psql "$PG_DSN" -f migrations/005_idx_cover_next_transfers.sql
 
 Environment
 - PG_DSN: postgres://user:pass@localhost:5432/db?sslmode=disable

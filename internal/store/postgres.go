@@ -60,6 +60,14 @@ func (p *Postgres) LatestBlockNumber(ctx context.Context) (int64, error) {
     return num, err
 }
 
+func (p *Postgres) LatestProcessedHour(ctx context.Context) (time.Time, error) {
+    var ts *time.Time
+    err := p.pool.QueryRow(ctx, `SELECT date_trunc('hour', MAX(hour)) FROM token_transfer_hourly`).Scan(&ts)
+    if err != nil { return time.Time{}, err }
+    if ts == nil { return time.Time{}, nil }
+    return ts.UTC(), nil
+}
+
 func (p *Postgres) NextTransfers(ctx context.Context, lastBlock, lastLogIdx int64, limit int) ([]models.TransferRow, error) {
     rows, err := p.pool.Query(ctx, `
         SELECT token_address, block_timestamp, block_number, log_index
@@ -68,6 +76,31 @@ func (p *Postgres) NextTransfers(ctx context.Context, lastBlock, lastLogIdx int6
         ORDER BY block_number ASC, log_index ASC
         LIMIT $3
     `, lastBlock, lastLogIdx, limit)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    var out []models.TransferRow
+    for rows.Next() {
+        var r models.TransferRow
+        if err := rows.Scan(&r.TokenAddress, &r.BlockTimestamp, &r.BlockNumber, &r.LogIndex); err != nil {
+            return nil, err
+        }
+        out = append(out, r)
+    }
+    return out, rows.Err()
+}
+
+func (p *Postgres) NextTransfersSafe(ctx context.Context, lastBlock, lastLogIdx int64, maxBlock int64, limit int) ([]models.TransferRow, error) {
+    rows, err := p.pool.Query(ctx, `
+        SELECT token_address, block_timestamp, block_number, log_index
+        FROM token_transfers
+        WHERE ((block_number > $1) OR (block_number = $1 AND log_index > $2))
+          AND block_number <= $3
+        ORDER BY block_number ASC, log_index ASC
+        LIMIT $4
+    `, lastBlock, lastLogIdx, maxBlock, limit)
     if err != nil {
         return nil, err
     }
@@ -99,6 +132,26 @@ func (p *Postgres) UpsertHourly(ctx context.Context, token string, ts time.Time)
         return errors.New("no rows affected")
     }
     return nil
+}
+
+func (p *Postgres) UpsertHourlyBatch(ctx context.Context, tokens []string, hours []time.Time, counts []int64) error {
+    if len(tokens) == 0 { return nil }
+    // Build arrays for UNNEST
+    // Note: pgx converts slices automatically.
+    _, err := p.pool.Exec(ctx, `
+        WITH upserts AS (
+            SELECT unnest($1::varchar[]) AS token,
+                   unnest($2::timestamp[]) AS hour,
+                   unnest($3::bigint[]) AS cnt
+        )
+        INSERT INTO token_transfer_hourly (token_address, hour, txs_count)
+        SELECT token, hour, SUM(cnt)
+        FROM upserts
+        GROUP BY token, hour
+        ON CONFLICT (token_address, hour)
+        DO UPDATE SET txs_count = token_transfer_hourly.txs_count + EXCLUDED.txs_count
+    `, tokens, hours, counts)
+    return err
 }
 
 func (p *Postgres) TopTokens8hExact(ctx context.Context, limit int) ([]models.TokenCount, time.Time, time.Time, error) {

@@ -11,8 +11,11 @@ type Store interface {
     GetCheckpoint(ctx context.Context, workerID string) (lastBlock int64, lastLogIdx int64, err error)
     SetCheckpoint(ctx context.Context, workerID string, lastBlock int64, lastLogIdx int64) error
     LatestBlockNumber(ctx context.Context) (int64, error)
+    LatestProcessedHour(ctx context.Context) (time.Time, error)
     NextTransfers(ctx context.Context, lastBlock, lastLogIdx int64, limit int) ([]models.TransferRow, error)
+    NextTransfersSafe(ctx context.Context, lastBlock, lastLogIdx int64, maxBlock int64, limit int) ([]models.TransferRow, error)
     UpsertHourly(ctx context.Context, token string, ts time.Time) error
+    UpsertHourlyBatch(ctx context.Context, tokens []string, hours []time.Time, counts []int64) error
     TopTokens8hExact(ctx context.Context, limit int) (items []models.TokenCount, winFrom, winTo time.Time, err error)
     TopTokens8hWithMeta(ctx context.Context, limit int) (items []models.TokenWithMeta, winFrom, winTo time.Time, err error)
     HourlySeries(ctx context.Context, token string, from, to time.Time) ([]models.HourPoint, error)
