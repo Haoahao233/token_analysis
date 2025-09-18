@@ -29,10 +29,23 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 func (h *Handler) TopTokens(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     limit := h.parseLimit(r, h.LeaderboardSize)
+    if h.Cache != nil {
+        if wf, wt, items, ok, err := h.Cache.GetLeaderboard8hWithMeta(ctx, limit); err == nil && ok {
+            writeJSON(w, http.StatusOK, map[string]any{
+                "window": models.Window{From: wf, To: wt},
+                "tokens": items,
+            })
+            return
+        }
+    }
+
     items, wf, wt, err := h.Store.TopTokens8hWithMeta(ctx, limit)
     if err != nil {
         httpError(w, http.StatusInternalServerError, err)
         return
+    }
+    if h.Cache != nil {
+        _ = h.Cache.SetLeaderboard8hWithMeta(ctx, wf, wt, items)
     }
     writeJSON(w, http.StatusOK, map[string]any{
         "window": models.Window{From: wf, To: wt},
@@ -45,6 +58,10 @@ func (h *Handler) tokenSubroutes(w http.ResponseWriter, r *http.Request) {
     parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
     if len(parts) == 4 && parts[0] == "tokens" && parts[2] == "txs" && parts[3] == "hourly" {
         h.HourlySeries(w, r, parts[1])
+        return
+    }
+    if len(parts) == 4 && parts[0] == "tokens" && parts[2] == "txs" && parts[3] == "8h" {
+        h.Series8h(w, r, parts[1])
         return
     }
     if len(parts) == 3 && parts[0] == "tokens" && parts[2] == "metadata" {
@@ -61,6 +78,28 @@ func (h *Handler) HourlySeries(w http.ResponseWriter, r *http.Request, token str
     if err != nil {
         httpError(w, http.StatusInternalServerError, err)
         return
+    }
+    writeJSON(w, http.StatusOK, map[string]any{
+        "token_address": token,
+        "from": from,
+        "to": to,
+        "points": pts,
+    })
+}
+
+// GET /tokens/{token}/txs/8h
+func (h *Handler) Series8h(w http.ResponseWriter, r *http.Request, token string) {
+    ctx := r.Context()
+    pts, err := h.Store.Series8h(ctx, token)
+    if err != nil {
+        httpError(w, http.StatusInternalServerError, err)
+        return
+    }
+    // derive time window from series if present
+    var from, to time.Time
+    if len(pts) > 0 {
+        from = pts[0].Hour
+        to = pts[len(pts)-1].Hour
     }
     writeJSON(w, http.StatusOK, map[string]any{
         "token_address": token,
@@ -93,27 +132,28 @@ func (h *Handler) parseLimit(r *http.Request, def int) int {
 func parseWindow(r *http.Request, def time.Duration) (time.Time, time.Time) {
     q := r.URL.Query()
     now := time.Now().UTC()
-    fromStr := q.Get("from")
-    toStr := q.Get("to")
-    var from, to time.Time
-    var err error
-    if toStr != "" {
-        to, err = time.Parse(time.RFC3339, toStr)
-        if err != nil {
-            to = now
+    to := parseTimeParam(q.Get("to"), now)
+    from := parseTimeParam(q.Get("from"), to.Add(-def))
+    // ensure order
+    if from.After(to) { from, to = to, from }
+    return from.Truncate(time.Hour).UTC(), to.Truncate(time.Hour).UTC()
+}
+
+// parseTimeParam accepts unix seconds or milliseconds, or RFC3339 as fallback.
+func parseTimeParam(v string, fallback time.Time) time.Time {
+    if v == "" { return fallback }
+    if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+        // Heuristic: >= 1e12 -> milliseconds
+        if n >= 1_000_000_000_000 { // ms
+            return time.Unix(0, n*int64(time.Millisecond)).UTC()
         }
-    } else {
-        to = now
+        // seconds
+        return time.Unix(n, 0).UTC()
     }
-    if fromStr != "" {
-        from, err = time.Parse(time.RFC3339, fromStr)
-        if err != nil {
-            from = to.Add(-def)
-        }
-    } else {
-        from = to.Add(-def)
+    if t, err := time.Parse(time.RFC3339, v); err == nil {
+        return t.UTC()
     }
-    return from.UTC(), to.UTC()
+    return fallback
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

@@ -2,6 +2,7 @@ package cache
 
 import (
     "context"
+    "encoding/json"
     "strconv"
     "time"
 
@@ -24,6 +25,7 @@ const (
     lbKey = "leaderboard:8h"
     lbFromKey = "leaderboard:8h:from"
     lbToKey = "leaderboard:8h:to"
+    lbMetaJSONKey = "leaderboard:8h:meta:json"
 )
 
 func (r *Redis) GetLeaderboard8h(ctx context.Context, limit int) (time.Time, time.Time, []models.TokenCount, bool, error) {
@@ -73,3 +75,42 @@ func (r *Redis) SetLeaderboard8h(ctx context.Context, winFrom, winTo time.Time, 
     return err
 }
 
+func (r *Redis) GetLeaderboard8hWithMeta(ctx context.Context, limit int) (time.Time, time.Time, []models.TokenWithMeta, bool, error) {
+    fromStr, err1 := r.cli.Get(ctx, lbFromKey).Result()
+    toStr, err2 := r.cli.Get(ctx, lbToKey).Result()
+    if err1 != nil || err2 != nil {
+        return time.Time{}, time.Time{}, nil, false, nil
+    }
+    fromUnix, _ := strconv.ParseInt(fromStr, 10, 64)
+    toUnix, _ := strconv.ParseInt(toStr, 10, 64)
+    from := time.Unix(fromUnix, 0).UTC()
+    to := time.Unix(toUnix, 0).UTC()
+
+    js, err := r.cli.Get(ctx, lbMetaJSONKey).Result()
+    if err != nil || js == "" {
+        return time.Time{}, time.Time{}, nil, false, nil
+    }
+    var all []models.TokenWithMeta
+    if err := json.Unmarshal([]byte(js), &all); err != nil {
+        return time.Time{}, time.Time{}, nil, false, nil
+    }
+    if limit < len(all) {
+        all = all[:limit]
+    }
+    return from, to, all, true, nil
+}
+
+func (r *Redis) SetLeaderboard8hWithMeta(ctx context.Context, winFrom, winTo time.Time, items []models.TokenWithMeta) error {
+    b, err := json.Marshal(items)
+    if err != nil { return err }
+    pipe := r.cli.TxPipeline()
+    pipe.Set(ctx, lbMetaJSONKey, string(b), 0)
+    pipe.Set(ctx, lbFromKey, strconv.FormatInt(winFrom.Unix(), 10), 0)
+    pipe.Set(ctx, lbToKey, strconv.FormatInt(winTo.Unix(), 10), 0)
+    // TTLs
+    pipe.Expire(ctx, lbMetaJSONKey, 2*time.Minute)
+    pipe.Expire(ctx, lbFromKey, 2*time.Minute)
+    pipe.Expire(ctx, lbToKey, 2*time.Minute)
+    _, err = pipe.Exec(ctx)
+    return err
+}

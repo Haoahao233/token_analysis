@@ -13,8 +13,8 @@ import (
 
 type Worker struct {
     Store  store.Store
-    Cache  cache.Cache
     WorkerID string
+    Cache  cache.Cache
 
     BatchSize int
     ReorgDepth int64
@@ -69,7 +69,7 @@ func (w *Worker) Run(ctx context.Context) error {
         if lastB >= safe {
             select {
             case <-ticker.C:
-                w.refreshLeaderboard(ctx)
+                w.roll8h(ctx)
             default:
             }
             time.Sleep(w.IdleDelay)
@@ -85,7 +85,7 @@ func (w *Worker) Run(ctx context.Context) error {
         if len(rows) == 0 {
             select {
             case <-ticker.C:
-                w.refreshLeaderboard(ctx)
+                w.roll8h(ctx)
             default:
             }
             time.Sleep(w.IdleDelay)
@@ -171,6 +171,8 @@ func (w *Worker) Run(ctx context.Context) error {
 
         select {
         case <-ticker.C:
+            // roll the 8-hour window up to safe hour
+            w.roll8h(ctx)
             w.refreshLeaderboard(ctx)
         case <-progTicker.C:
             // progress report: checkpoint vs safe/latest, lag, throughput
@@ -213,20 +215,39 @@ func (w *Worker) Run(ctx context.Context) error {
     }
 }
 
-func (w *Worker) refreshLeaderboard(ctx context.Context) {
-    if w.Cache == nil { return }
-    items, from, to, err := func() ([]models.TokenCount, time.Time, time.Time, error) {
-        it, f, t, err := w.Store.TopTokens8hExact(ctx, w.LeaderboardSize)
-        if err != nil {
-            return nil, time.Time{}, time.Time{}, err
+func (w *Worker) roll8h(ctx context.Context) {
+    // compute safe hour based on chain tip
+    latest, err := w.Store.LatestBlockNumber(ctx)
+    if err != nil { return }
+    safe := latest - w.ReorgDepth
+    safeHour, err := w.Store.LatestSafeHour(ctx, safe)
+    if err != nil || safeHour.IsZero() { return }
+
+    cur, err := w.Store.Get8hCursorHour(ctx)
+    if err != nil { return }
+    if cur.IsZero() {
+        // initialize to safe hour snapshot
+        if err := w.Store.Rebuild8hAtHour(ctx, safeHour); err == nil {
+            _ = w.Store.Set8hCursorHour(ctx, safeHour)
         }
-        return it, f, t, nil
-    }()
-    if err != nil {
-        log.Printf("TopTokens8hExact error: %v", err)
         return
     }
-    if err := w.Cache.SetLeaderboard8h(ctx, from, to, items); err != nil {
-        log.Printf("SetLeaderboard8h error: %v", err)
+    // advance hour by hour up to safeHour
+    for h := cur.Add(time.Hour); !h.After(safeHour); h = h.Add(time.Hour) {
+        // add new hour into points and summary
+        if err := w.Store.Add8hPointsHour(ctx, h); err != nil { break }
+        if err := w.Store.Add8hHour(ctx, h); err != nil { break }
+        // drop hour outside window
+        out := h.Add(-8 * time.Hour)
+        if err := w.Store.Sub8hHour(ctx, out); err != nil { break }
+        _ = w.Store.Sub8hPointsHour(ctx, out)
+        _ = w.Store.Set8hCursorHour(ctx, h)
     }
+}
+
+func (w *Worker) refreshLeaderboard(ctx context.Context) {
+    if w.Cache == nil { return }
+    items, from, to, err := w.Store.TopTokens8hWithMeta(ctx, w.LeaderboardSize)
+    if err != nil { return }
+    _ = w.Cache.SetLeaderboard8hWithMeta(ctx, from, to, items)
 }

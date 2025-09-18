@@ -24,6 +24,7 @@ Migrations (SQL)
 Run migrations in Postgres before starting services:
 
   psql "$PG_DSN" -f migrations/001_init.sql
+  psql "$PG_DSN" -f migrations/003_token_transfer_8hour.sql
 
 Environment
 - PG_DSN: postgres://user:pass@localhost:5432/db?sslmode=disable
@@ -55,10 +56,19 @@ Run
 
 API Endpoints
 - GET /tokens/top?limit=100
-  Response: {"window": {"from":"...","to":"..."}, "tokens":[{"token_address":"0x..","name":"","symbol":"","decimals":18,"total_supply":"...","txs_count":123}]}
+  - 仅返回能查到 symbol 的 ERC20 代币
+  - Response: {"window": {"from":"...","to":"..."}, "tokens":[{"token_address":"0x..","name":"","symbol":"","decimals":18,"total_supply":"...","txs_count":123}]}
 
 - GET /tokens/{token}/txs/hourly?from=ISO&to=ISO
-  Response: {"token_address":"0x..","from":"...","to":"...","points":[{"hour":"...","txs_count":12}]}
+  - token 为 ERC20 合约地址（0x 开头 42 字符）
+  - 查询参数 from/to 支持 Unix 时间戳（秒或毫秒）或 RFC3339 字符串；建议使用时间戳
+    - 例：`from=1726617600&to=1726646400`（秒）或 `from=1726617600000&to=1726646400000`（毫秒）
+    - 为空时默认：`to=now`，`from=to-24h`
+  - Response: {"token_address":"0x..","from":"...","to":"...","points":[{"hour":"...","txs_count":12}]}
+
+- GET /tokens/{token}/txs/8h
+  - 直接返回最近 8 小时的每小时桶（来自 token_transfer_8hour_points）
+  - Response: {"token_address":"0x..","from":"...","to":"...","points":[{"hour":"...","txs_count":12}]}
 
 - GET /tokens/{token}/metadata
   Response: {"token_address":"0x..","name":"","symbol":"","decimals":18,"total_supply":"...","first_seen_block":0,"updated_at":"..."}
@@ -71,6 +81,15 @@ Notes
   - 确保 token_metadata 存在并更新 first_seen_block（取最小值）
   - 若该 token 元数据缺失（name/symbol/decimals/total_supply 为空），将通过本地 RPC 获取并回写（不会覆盖已有非空字段）。在非合约地址或合约返回 revert 时跳过，并按间隔重试。
   - 周期性打印同步进度：checkpoint、安全区块、落后区块数、累计/最近处理速率
+
+8-hour Materialized Window
+- Table: `token_transfer_8hour` holds rolling sums per token for the last 8 hours.
+- Table: `token_transfer_8hour_points` holds per-token per-hour buckets for the last 8 hours.
+- Maintained by the worker via hourly roll-forward using `token_transfer_hourly`:
+  - On each hour advancement to safe hour H: add counts for H; subtract counts for H-8h.
+  - Points table：插入 H 小时，删除 H-8h 小时。
+  - Initial bootstrap builds sums for [H-7h, H].
+- API `/tokens/top` reads from `token_transfer_8hour` (LEFT JOIN token_metadata, filter symbol present), so queries are fast and stable.
 
 Metadata
 - Table: token_metadata (address, name, symbol, decimals, total_supply, first_seen_block, updated_at)

@@ -128,22 +128,26 @@ func (p *Postgres) TopTokens8hExact(ctx context.Context, limit int) ([]models.To
 }
 
 func (p *Postgres) TopTokens8hWithMeta(ctx context.Context, limit int) ([]models.TokenWithMeta, time.Time, time.Time, error) {
-    to := time.Now().UTC()
-    from := to.Add(-8 * time.Hour)
+    // window anchored at 8h cursor hour
+    var sec int64
+    _ = p.pool.QueryRow(ctx, `SELECT last_block FROM worker_offsets WHERE id = $1`, t8hCursorID).Scan(&sec)
+    to := time.Unix(sec, 0).UTC().Truncate(time.Hour)
+    if to.IsZero() { to = time.Now().UTC().Truncate(time.Hour) }
+    from := to.Add(-7 * time.Hour)
+
     rows, err := p.pool.Query(ctx, `
-        SELECT t.token_address,
+        SELECT t8.token_address,
                COALESCE(m.name, '') AS name,
                COALESCE(m.symbol, '') AS symbol,
                COALESCE(m.decimals, 0) AS decimals,
                COALESCE(m.total_supply::text, '') AS total_supply,
-               COUNT(*) AS txs_count
-        FROM token_transfers t
-        LEFT JOIN token_metadata m ON m.token_address = t.token_address
-        WHERE t.block_timestamp >= $1 AND t.block_timestamp < $2
-        GROUP BY t.token_address, m.name, m.symbol, m.decimals, m.total_supply
-        ORDER BY txs_count DESC
-        LIMIT $3
-    `, from, to, limit)
+               t8.txs_count AS txs_count
+        FROM token_transfer_8hour t8
+        LEFT JOIN token_metadata m ON m.token_address = t8.token_address
+        WHERE m.symbol IS NOT NULL AND m.symbol <> ''
+        ORDER BY t8.txs_count DESC
+        LIMIT $1
+    `, limit)
     if err != nil {
         return nil, from, to, err
     }
@@ -264,4 +268,112 @@ func (p *Postgres) EnsureTokenMetadataRow(ctx context.Context, token string, fir
         DO UPDATE SET first_seen_block = LEAST(token_metadata.first_seen_block, EXCLUDED.first_seen_block)
     `, token, firstSeenBlock)
     return err
+}
+
+// 8-hour window state stored in worker_offsets with id 'analysis-worker:8h-hour'
+const t8hCursorID = "analysis-worker:8h-hour"
+
+func (p *Postgres) Get8hCursorHour(ctx context.Context) (time.Time, error) {
+    var sec int64
+    err := p.pool.QueryRow(ctx, `SELECT last_block FROM worker_offsets WHERE id = $1`, t8hCursorID).Scan(&sec)
+    if err != nil {
+        return time.Time{}, nil
+    }
+    return time.Unix(sec, 0).UTC().Truncate(time.Hour), nil
+}
+
+func (p *Postgres) Set8hCursorHour(ctx context.Context, hour time.Time) error {
+    sec := hour.UTC().Truncate(time.Hour).Unix()
+    _, err := p.pool.Exec(ctx, `
+        INSERT INTO worker_offsets (id, last_block, last_log_index, updated_at)
+        VALUES ($1, $2, 0, NOW())
+        ON CONFLICT (id) DO UPDATE SET last_block = EXCLUDED.last_block, updated_at = NOW()
+    `, t8hCursorID, sec)
+    return err
+}
+
+func (p *Postgres) LatestSafeHour(ctx context.Context, safeBlock int64) (time.Time, error) {
+    var ts time.Time
+    err := p.pool.QueryRow(ctx, `
+        SELECT date_trunc('hour', MAX(timestamp))
+        FROM blocks WHERE number <= $1
+    `, safeBlock).Scan(&ts)
+    if err != nil { return time.Time{}, err }
+    return ts.UTC(), nil
+}
+
+func (p *Postgres) Add8hHour(ctx context.Context, hour time.Time) error {
+    _, err := p.pool.Exec(ctx, `
+        INSERT INTO token_transfer_8hour (token_address, txs_count, updated_at)
+        SELECT token_address, txs_count, NOW()
+        FROM token_transfer_hourly
+        WHERE hour = $1
+        ON CONFLICT (token_address)
+        DO UPDATE SET txs_count = token_transfer_8hour.txs_count + EXCLUDED.txs_count,
+                      updated_at = NOW()
+    `, hour.UTC().Truncate(time.Hour))
+    return err
+}
+
+func (p *Postgres) Sub8hHour(ctx context.Context, hour time.Time) error {
+    _, err := p.pool.Exec(ctx, `
+        UPDATE token_transfer_8hour t8
+        SET txs_count = GREATEST(0, t8.txs_count - h.txs_count),
+            updated_at = NOW()
+        FROM token_transfer_hourly h
+        WHERE h.hour = $1 AND h.token_address = t8.token_address
+    `, hour.UTC().Truncate(time.Hour))
+    if err != nil { return err }
+    // optional cleanup
+    _, err = p.pool.Exec(ctx, `DELETE FROM token_transfer_8hour WHERE txs_count = 0`)
+    return err
+}
+
+func (p *Postgres) Rebuild8hAtHour(ctx context.Context, hour time.Time) error {
+    h := hour.UTC().Truncate(time.Hour)
+    _, err := p.pool.Exec(ctx, `DELETE FROM token_transfer_8hour`)
+    if err != nil { return err }
+    _, err = p.pool.Exec(ctx, `
+        INSERT INTO token_transfer_8hour (token_address, txs_count, updated_at)
+        SELECT token_address, SUM(txs_count) AS s, NOW()
+        FROM token_transfer_hourly
+        WHERE hour >= $1 - INTERVAL '7 hours' AND hour <= $1
+        GROUP BY token_address
+    `, h)
+    return err
+}
+
+func (p *Postgres) Add8hPointsHour(ctx context.Context, hour time.Time) error {
+    h := hour.UTC().Truncate(time.Hour)
+    _, err := p.pool.Exec(ctx, `
+        INSERT INTO token_transfer_8hour_points (token_address, hour, txs_count)
+        SELECT token_address, hour, txs_count FROM token_transfer_hourly WHERE hour = $1
+        ON CONFLICT (token_address, hour)
+        DO UPDATE SET txs_count = EXCLUDED.txs_count
+    `, h)
+    return err
+}
+
+func (p *Postgres) Sub8hPointsHour(ctx context.Context, hour time.Time) error {
+    h := hour.UTC().Truncate(time.Hour)
+    _, err := p.pool.Exec(ctx, `DELETE FROM token_transfer_8hour_points WHERE hour = $1`, h)
+    return err
+}
+
+func (p *Postgres) Series8h(ctx context.Context, token string) ([]models.HourPoint, error) {
+    rows, err := p.pool.Query(ctx, `
+        SELECT hour, txs_count
+        FROM token_transfer_8hour_points
+        WHERE token_address = $1
+        ORDER BY hour ASC
+    `, token)
+    if err != nil { return nil, err }
+    defer rows.Close()
+    var out []models.HourPoint
+    for rows.Next() {
+        var hp models.HourPoint
+        if err := rows.Scan(&hp.Hour, &hp.TxCount); err != nil { return nil, err }
+        out = append(out, hp)
+    }
+    return out, rows.Err()
 }

@@ -25,4 +25,17 @@ type Store interface {
 
     // Ensure a token_metadata row exists and update first_seen_block with LEAST(existing, provided)
     EnsureTokenMetadataRow(ctx context.Context, token string, firstSeenBlock int64) error
+
+    // 8-hour materialized window maintenance
+    Get8hCursorHour(ctx context.Context) (time.Time, error)
+    Set8hCursorHour(ctx context.Context, hour time.Time) error
+    LatestSafeHour(ctx context.Context, safeBlock int64) (time.Time, error)
+    Add8hHour(ctx context.Context, hour time.Time) error
+    Sub8hHour(ctx context.Context, hour time.Time) error
+    Rebuild8hAtHour(ctx context.Context, hour time.Time) error
+
+    // 8h points (per hour per token) maintenance and queries
+    Add8hPointsHour(ctx context.Context, hour time.Time) error
+    Sub8hPointsHour(ctx context.Context, hour time.Time) error
+    Series8h(ctx context.Context, token string) ([]models.HourPoint, error)
 }
