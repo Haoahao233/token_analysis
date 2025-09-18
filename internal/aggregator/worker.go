@@ -77,14 +77,14 @@ func (w *Worker) Run(ctx context.Context) error {
         }
 
         t0 := time.Now()
-        rows, err := w.Store.NextTransfersSafe(ctx, lastB, lastIdx, safe, w.BatchSize)
+        newB, newIdx, processed, err := w.Store.AggregateHourlyNextBatch(ctx, lastB, lastIdx, safe, w.BatchSize)
         if err != nil {
-            log.Printf("NextTransfers error: %v", err)
+            log.Printf("AggregateHourlyNextBatch error: %v", err)
             time.Sleep(w.IdleDelay)
             continue
         }
         pullMs := time.Since(t0).Milliseconds()
-        if len(rows) == 0 {
+        if processed == 0 {
             select {
             case <-ticker.C:
                 w.roll8h(ctx)
@@ -93,56 +93,24 @@ func (w *Worker) Run(ctx context.Context) error {
             time.Sleep(w.IdleDelay)
             continue
         }
-        log.Printf("pull: rows=%d in %dms (cp=%d:%d safe=%d)", len(rows), pullMs, lastB, lastIdx, safe)
+        log.Printf("db-agg: rows=%d in %dms (cp=%d:%d -> %d:%d safe=%d)", processed, pullMs, lastB, lastIdx, newB, newIdx, safe)
 
         var maxB, maxIdx int64
-        // track minimal first seen block per token in this batch
-        minBlockByToken := map[string]int64{}
-        // aggregate hourly increments to batch-upsert
-        aggTokens := make([]string, 0, len(rows))
-        aggHours := make([]time.Time, 0, len(rows))
-        aggCounts := make([]int64, 0, len(rows))
-        // use a map to group duplicates within the batch
-        type key struct{ token string; hour time.Time }
-        inc := make(map[key]int64)
-        for _, r := range rows {
-            h := r.BlockTimestamp.Truncate(time.Hour)
-            inc[key{token: r.TokenAddress, hour: h}]++
-            if mb, ok := minBlockByToken[r.TokenAddress]; !ok || r.BlockNumber < mb {
-                minBlockByToken[r.TokenAddress] = r.BlockNumber
-            }
-            maxB, maxIdx = r.BlockNumber, r.LogIndex
-            totalProcessed++
-            processedSinceReport++
-        }
-        // flush batch upsert
-        if len(inc) > 0 {
-            t1 := time.Now()
-            for k, v := range inc {
-                aggTokens = append(aggTokens, k.token)
-                aggHours = append(aggHours, k.hour)
-                aggCounts = append(aggCounts, v)
-            }
-            if err := w.Store.UpsertHourlyBatch(ctx, aggTokens, aggHours, aggCounts); err != nil {
-                log.Printf("UpsertHourlyBatch error: %v", err)
-            }
-            log.Printf("upsert-hourly: keys=%d in %dms", len(aggTokens), time.Since(t1).Milliseconds())
-        }
+        // update counters and checkpoint
+        totalProcessed += processed
+        processedSinceReport += processed
+        maxB, maxIdx = newB, newIdx
         if maxB > 0 {
             if err := w.Store.SetCheckpoint(ctx, w.WorkerID, maxB, maxIdx); err != nil {
                 log.Printf("SetCheckpoint error: %v", err)
             }
         }
-
-        // ensure token_metadata rows exist and update first_seen_block conservatively
-        for token, fsb := range minBlockByToken {
-            if err := w.Store.EnsureTokenMetadataRow(ctx, token, fsb); err != nil {
-                log.Printf("EnsureTokenMetadataRow %s error: %v", token, err)
-            }
-        }
-
+        // note: server-side aggregation path doesn't expose per-token min block here.
+        // For metadata ensure/enrich, we can fetch distinct tokens in the batch if needed via a separate small query later.
         if w.ERC20 != nil {
-            for token := range minBlockByToken {
+            // TODO: optional token set discovery per batch if enriching metadata is required at scale.
+            // Skipped here to keep the hot path fast.
+        }
                 // backoff repeated failures
                 if t, ok := w.lastMetaAttempt[token]; ok && time.Since(t) < w.MetaRetryInterval {
                     continue

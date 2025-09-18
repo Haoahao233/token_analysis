@@ -430,3 +430,38 @@ func (p *Postgres) Series8h(ctx context.Context, token string) ([]models.HourPoi
     }
     return out, rows.Err()
 }
+
+// AggregateHourlyNextBatch groups the next N safe rows server-side and upserts hourly counts, returning the new checkpoint and processed row count.
+func (p *Postgres) AggregateHourlyNextBatch(ctx context.Context, lastBlock, lastLogIdx, maxBlock int64, limit int) (int64, int64, int64, error) {
+    var newB, newIdx, processed int64
+    err := p.pool.QueryRow(ctx, `
+        WITH next AS (
+            SELECT token_address, block_timestamp, block_number, log_index
+            FROM token_transfers
+            WHERE ((block_number > $1) OR (block_number = $1 AND log_index > $2))
+              AND block_number <= $3
+            ORDER BY block_number ASC, log_index ASC
+            LIMIT $4
+        ), last AS (
+            SELECT block_number, log_index
+            FROM next
+            ORDER BY block_number DESC, log_index DESC
+            LIMIT 1
+        ), agg AS (
+            SELECT token_address, date_trunc('hour', block_timestamp) AS hour, COUNT(*) AS cnt
+            FROM next
+            GROUP BY token_address, date_trunc('hour', block_timestamp)
+        ), ins AS (
+            INSERT INTO token_transfer_hourly (token_address, hour, txs_count)
+            SELECT token_address, hour, cnt FROM agg
+            ON CONFLICT (token_address, hour)
+            DO UPDATE SET txs_count = token_transfer_hourly.txs_count + EXCLUDED.txs_count
+            RETURNING 1
+        )
+        SELECT COALESCE((SELECT block_number FROM last), $1) AS new_block,
+               COALESCE((SELECT log_index FROM last), $2) AS new_log,
+               (SELECT COUNT(*) FROM next) AS processed
+    `, lastBlock, lastLogIdx, maxBlock, limit).Scan(&newB, &newIdx, &processed)
+    if err != nil { return 0, 0, 0, err }
+    return newB, newIdx, processed, nil
+}

@@ -41,4 +41,7 @@ type Store interface {
     Add8hPointsHour(ctx context.Context, hour time.Time) error
     Sub8hPointsHour(ctx context.Context, hour time.Time) error
     Series8h(ctx context.Context, token string) ([]models.HourPoint, error)
+
+    // Server-side aggregation of next batch to hourly buckets; returns new checkpoint and processed row count
+    AggregateHourlyNextBatch(ctx context.Context, lastBlock, lastLogIdx, maxBlock int64, limit int) (newLastBlock, newLastLogIdx int64, processed int64, err error)
 }
