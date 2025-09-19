@@ -351,32 +351,7 @@ func (p *Postgres) LatestSafeHour(ctx context.Context, safeBlock int64) (time.Ti
     return ts.UTC(), nil
 }
 
-func (p *Postgres) Add8hHour(ctx context.Context, hour time.Time) error {
-    _, err := p.pool.Exec(ctx, `
-        INSERT INTO token_transfer_8hour (token_address, txs_count, updated_at)
-        SELECT token_address, txs_count, NOW()
-        FROM token_transfer_hourly
-        WHERE hour = $1
-        ON CONFLICT (token_address)
-        DO UPDATE SET txs_count = token_transfer_8hour.txs_count + EXCLUDED.txs_count,
-                      updated_at = NOW()
-    `, hour.UTC().Truncate(time.Hour))
-    return err
-}
-
-func (p *Postgres) Sub8hHour(ctx context.Context, hour time.Time) error {
-    _, err := p.pool.Exec(ctx, `
-        UPDATE token_transfer_8hour t8
-        SET txs_count = GREATEST(0, t8.txs_count - h.txs_count),
-            updated_at = NOW()
-        FROM token_transfer_hourly h
-        WHERE h.hour = $1 AND h.token_address = t8.token_address
-    `, hour.UTC().Truncate(time.Hour))
-    if err != nil { return err }
-    // optional cleanup
-    _, err = p.pool.Exec(ctx, `DELETE FROM token_transfer_8hour WHERE txs_count = 0`)
-    return err
-}
+// legacy 8h summary/points tables removed; using token_8h_cache instead
 
 // legacy 8h tables removed; using token_8h_cache instead
 

@@ -10,9 +10,9 @@ Token Analytics — 8h Leaderboard and Series
     - `/` — Leaderboard (single column with rank, token, bar, 8h txs)
     - `/token.html?address=0x...` — Token page (8h line chart + metadata, Etherscan link)
 - Implementation
-  - Analysis worker ingests `token_transfers`, writes hourly aggregates (`token_transfer_hourly`), and maintains two materialized 8h tables:
-    - `token_transfer_8hour_points` — per‑token 8 buckets (one per hour), derived from hourly
-    - `token_transfer_8hour` — per‑token rolling sum over last 8 hours, derived from the points table
+  - Analysis worker ingests `token_transfers`, writes hourly aggregates (`token_transfer_hourly`), and maintains a single 8h cache table:
+    - `token_8h_cache` — per‑token ring buffer (counts integer[8], base_hour timestamptz, sum8 bigint)
+      derived from `token_transfer_hourly` for the safe 8 full hours [H-7h..H]. Leaderboard and 8h series read from this cache.
   - Worker refreshes a Redis cache for the leaderboard (JSON + window times)
   - Optional metadata worker fetches ERC20 info via RPC and stores into `token_metadata`
 
@@ -51,5 +51,5 @@ Token Analytics — 8h Leaderboard and Series
 Notes
 - The worker aggregates on the DB side (LIMIT → GROUP BY (token,hour) → UPSERT) and processes only up to `safe = latest − REORG_DEPTH`.
 - When the checkpoint block equals `safe`, it still finishes that block by `log_index`.
-- The 8h tables are updated after each batch and on a periodic ticker; first init seeds both summary and points.
+- The 8h cache is updated after each batch and on a periodic ticker; first init seeds the ring buffer for the current safe hour window.
 - If you backfill historical rows below the current checkpoint, recompute those hours (DELETE+INSERT for that hour) or add a background self‑heal task.
