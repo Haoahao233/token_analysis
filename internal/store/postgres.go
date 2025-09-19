@@ -394,25 +394,34 @@ func (p *Postgres) Rotate8hCacheToHour(ctx context.Context, hour time.Time) erro
     tx, err := p.pool.Begin(ctx)
     if err != nil { return err }
     defer func(){ _ = tx.Rollback(ctx) }()
-    // 1) rotate only rows behind target hour (idempotent for same hour)
-    if _, err := tx.Exec(ctx, `
-        UPDATE token_8h_cache
-        SET base_hour = $1::timestamptz,
-            counts = counts[2:8] || 0,
-            sum8 = sum8 - counts[1],
-            updated_at = NOW()
-        WHERE base_hour < $1::timestamptz
-    `, h); err != nil { return err }
-    // 2) upsert current hour values for existing tokens: replace last slot and fix sum
+    // A) rotate + write for tokens that have an hourly bucket at this hour
     if _, err := tx.Exec(ctx, `
         UPDATE token_8h_cache c
-        SET counts[8] = h.txs_count::integer,
-            sum8 = (c.sum8 - COALESCE(c.counts[8],0)::bigint) + h.txs_count::bigint,
-            updated_at = NOW()
+        SET base_hour = $1::timestamptz,
+            counts    = c.counts[2:8] || h.txs_count::integer,
+            sum8      = (c.sum8 - c.counts[1]) + h.txs_count::bigint,
+            updated_at= NOW()
         FROM token_transfer_hourly h
-        WHERE h.hour = $1::timestamptz AND c.token_address = h.token_address
+        WHERE c.base_hour < $1::timestamptz
+          AND h.hour = $1::timestamptz
+          AND h.token_address = c.token_address
     `, h); err != nil { return err }
-    // 3) insert rows for tokens not yet in cache
+
+    // B) rotate + append 0 for tokens without a bucket at this hour
+    if _, err := tx.Exec(ctx, `
+        UPDATE token_8h_cache c
+        SET base_hour = $1::timestamptz,
+            counts    = c.counts[2:8] || 0,
+            sum8      = (c.sum8 - c.counts[1]),
+            updated_at= NOW()
+        WHERE c.base_hour < $1::timestamptz
+          AND NOT EXISTS (
+            SELECT 1 FROM token_transfer_hourly h
+            WHERE h.hour = $1::timestamptz AND h.token_address = c.token_address
+          )
+    `, h); err != nil { return err }
+
+    // C) insert tokens first-seen at this hour
     if _, err := tx.Exec(ctx, `
         INSERT INTO token_8h_cache (token_address, base_hour, counts, sum8, updated_at)
         SELECT h.token_address, $1::timestamptz,
