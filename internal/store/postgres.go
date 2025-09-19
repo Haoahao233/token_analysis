@@ -189,16 +189,16 @@ func (p *Postgres) TopTokens8hWithMeta(ctx context.Context, limit int) ([]models
     from := to.Add(-7 * time.Hour)
 
     rows, err := p.pool.Query(ctx, `
-        SELECT t8.token_address,
+        SELECT c.token_address,
                COALESCE(m.name, '') AS name,
                COALESCE(m.symbol, '') AS symbol,
                COALESCE(m.decimals, 0) AS decimals,
                COALESCE(m.total_supply::text, '') AS total_supply,
-               t8.txs_count AS txs_count
-        FROM token_transfer_8hour t8
-        LEFT JOIN token_metadata m ON m.token_address = t8.token_address
+               c.sum8 AS txs_count
+        FROM token_8h_cache c
+        LEFT JOIN token_metadata m ON m.token_address = c.token_address
         WHERE m.symbol IS NOT NULL AND m.symbol <> ''
-        ORDER BY t8.txs_count DESC
+        ORDER BY c.sum8 DESC
         LIMIT $1
     `, limit)
     if err != nil {
@@ -217,26 +217,22 @@ func (p *Postgres) TopTokens8hWithMeta(ctx context.Context, limit int) ([]models
 }
 
 func (p *Postgres) HourlySeries(ctx context.Context, token string, from, to time.Time) ([]models.HourPoint, error) {
-    f := from.Truncate(time.Hour)
-    t := to.Truncate(time.Hour)
+    // Instead of scanning arbitrary ranges, return last 8 points from cache
     rows, err := p.pool.Query(ctx, `
-        SELECT hour, txs_count
-        FROM token_transfer_hourly
-        WHERE token_address = $1
-          AND hour >= $2 AND hour <= $3
+        WITH s AS (
+            SELECT base_hour, counts FROM token_8h_cache WHERE token_address = $1
+        )
+        SELECT (s.base_hour - (($2 - i) * INTERVAL '1 hour'))::timestamptz AS hour,
+               s.counts[i]::bigint AS txs_count
+        FROM s, generate_subscripts((SELECT counts FROM s), 1) AS i
         ORDER BY hour ASC
-    `, token, f, t)
-    if err != nil {
-        return nil, err
-    }
+    `, token, 8)
+    if err != nil { return nil, err }
     defer rows.Close()
-
     var out []models.HourPoint
     for rows.Next() {
         var hp models.HourPoint
-        if err := rows.Scan(&hp.Hour, &hp.TxCount); err != nil {
-            return nil, err
-        }
+        if err := rows.Scan(&hp.Hour, &hp.TxCount); err != nil { return nil, err }
         out = append(out, hp)
     }
     return out, rows.Err()
@@ -382,44 +378,97 @@ func (p *Postgres) Sub8hHour(ctx context.Context, hour time.Time) error {
     return err
 }
 
-func (p *Postgres) Rebuild8hAtHour(ctx context.Context, hour time.Time) error {
+// legacy 8h tables removed; using token_8h_cache instead
+
+// 8h cache (single-row-per-token with ring buffer)
+func (p *Postgres) Rebuild8hCacheAtHour(ctx context.Context, hour time.Time) error {
     h := hour.UTC().Truncate(time.Hour)
-    _, err := p.pool.Exec(ctx, `DELETE FROM token_transfer_8hour`)
+    tx, err := p.pool.Begin(ctx)
     if err != nil { return err }
-    _, err = p.pool.Exec(ctx, `
-        INSERT INTO token_transfer_8hour (token_address, txs_count, updated_at)
-        SELECT token_address, SUM(txs_count) AS s, NOW()
-        FROM token_transfer_hourly
-        WHERE hour BETWEEN ($1::timestamp - INTERVAL '7 hours') AND ($1::timestamp)
+    defer func(){ _ = tx.Rollback(ctx) }()
+    if _, err := tx.Exec(ctx, `DELETE FROM token_8h_cache`); err != nil { return err }
+    // Build per-token 8-hour arrays and sums
+    _, err = tx.Exec(ctx, `
+        WITH win AS (
+            SELECT generate_series($1::timestamptz - INTERVAL '7 hours', $1::timestamptz, INTERVAL '1 hour') AS hour
+        ), tok AS (
+            SELECT DISTINCT token_address FROM token_transfer_hourly
+            WHERE hour BETWEEN ($1::timestamptz - INTERVAL '7 hours') AND ($1::timestamptz)
+        ), grid AS (
+            SELECT t.token_address, w.hour FROM tok t CROSS JOIN win w
+        ), vals AS (
+            SELECT g.token_address, g.hour, COALESCE(h.txs_count,0)::integer AS txs_count
+            FROM grid g LEFT JOIN token_transfer_hourly h
+            ON h.token_address = g.token_address AND h.hour = g.hour
+        )
+        INSERT INTO token_8h_cache (token_address, base_hour, counts, sum8, updated_at)
+        SELECT token_address,
+               $1::timestamptz AS base_hour,
+               ARRAY_AGG(txs_count ORDER BY hour)::integer[] AS counts,
+               SUM(txs_count)::bigint AS sum8,
+               NOW()
+        FROM vals
         GROUP BY token_address
     `, h)
-    return err
+    if err != nil { return err }
+    return tx.Commit(ctx)
 }
 
-func (p *Postgres) Add8hPointsHour(ctx context.Context, hour time.Time) error {
+func (p *Postgres) Rotate8hCacheToHour(ctx context.Context, hour time.Time) error {
     h := hour.UTC().Truncate(time.Hour)
-    _, err := p.pool.Exec(ctx, `
-        INSERT INTO token_transfer_8hour_points (token_address, hour, txs_count)
-        SELECT token_address, hour, txs_count FROM token_transfer_hourly WHERE hour = $1
-        ON CONFLICT (token_address, hour)
-        DO UPDATE SET txs_count = EXCLUDED.txs_count
-    `, h)
-    return err
+    tx, err := p.pool.Begin(ctx)
+    if err != nil { return err }
+    defer func(){ _ = tx.Rollback(ctx) }()
+    // 1) rotate only rows behind target hour (idempotent for same hour)
+    if _, err := tx.Exec(ctx, `
+        UPDATE token_8h_cache
+        SET base_hour = $1::timestamptz,
+            counts = counts[2:8] || 0,
+            sum8 = sum8 - counts[1],
+            updated_at = NOW()
+        WHERE base_hour < $1::timestamptz
+    `, h); err != nil { return err }
+    // 2) upsert current hour values for existing tokens: replace last slot and fix sum
+    if _, err := tx.Exec(ctx, `
+        UPDATE token_8h_cache c
+        SET counts[8] = h.txs_count::integer,
+            sum8 = (c.sum8 - COALESCE(c.counts[8],0)::bigint) + h.txs_count::bigint,
+            updated_at = NOW()
+        FROM token_transfer_hourly h
+        WHERE h.hour = $1::timestamptz AND c.token_address = h.token_address
+    `, h); err != nil { return err }
+    // 3) insert rows for tokens not yet in cache
+    if _, err := tx.Exec(ctx, `
+        INSERT INTO token_8h_cache (token_address, base_hour, counts, sum8, updated_at)
+        SELECT h.token_address, $1::timestamptz,
+               ARRAY[0,0,0,0,0,0,0, h.txs_count::integer]::integer[],
+               h.txs_count::bigint,
+               NOW()
+        FROM token_transfer_hourly h
+        LEFT JOIN token_8h_cache c ON c.token_address = h.token_address
+        WHERE h.hour = $1::timestamptz AND c.token_address IS NULL
+    `, h); err != nil { return err }
+    return tx.Commit(ctx)
 }
 
-func (p *Postgres) Sub8hPointsHour(ctx context.Context, hour time.Time) error {
-    h := hour.UTC().Truncate(time.Hour)
-    _, err := p.pool.Exec(ctx, `DELETE FROM token_transfer_8hour_points WHERE hour = $1`, h)
-    return err
+func (p *Postgres) Has8hCacheData(ctx context.Context) (bool, error) {
+    var exists bool
+    err := p.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM token_8h_cache LIMIT 1)`).Scan(&exists)
+    return exists, err
 }
+
+// legacy points helpers removed
 
 func (p *Postgres) Series8h(ctx context.Context, token string) ([]models.HourPoint, error) {
     rows, err := p.pool.Query(ctx, `
-        SELECT hour, txs_count
-        FROM token_transfer_8hour_points
-        WHERE token_address = $1
+        WITH s AS (
+            SELECT base_hour, counts FROM token_8h_cache WHERE token_address = $1
+        )
+        SELECT (s.base_hour - (($2 - i) * INTERVAL '1 hour'))::timestamptz AS hour,
+               s.counts[i]::bigint AS txs_count
+        FROM s, generate_subscripts((SELECT counts FROM s), 1) AS i
         ORDER BY hour ASC
-    `, token)
+    `, token, 8)
     if err != nil { return nil, err }
     defer rows.Close()
     var out []models.HourPoint
@@ -430,6 +479,8 @@ func (p *Postgres) Series8h(ctx context.Context, token string) ([]models.HourPoi
     }
     return out, rows.Err()
 }
+
+// legacy summary-from-points helpers removed
 
 // AggregateHourlyNextBatch groups the next N safe rows server-side and upserts hourly counts, returning the new checkpoint and processed row count.
 func (p *Postgres) AggregateHourlyNextBatch(ctx context.Context, lastBlock, lastLogIdx, maxBlock int64, limit int) (int64, int64, int64, error) {

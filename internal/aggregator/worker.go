@@ -25,7 +25,7 @@ type Worker struct {
 }
 
 func (w *Worker) Run(ctx context.Context) error {
-	log.Printf("worker starting: reorgDepth=%d batchSize=%d", w.ReorgDepth, w.BatchSize)
+    log.Printf("worker: start reorgDepth=%d batchSize=%d", w.ReorgDepth, w.BatchSize)
 	ticker := time.NewTicker(w.LeaderboardInterval)
 	defer ticker.Stop()
 	progTicker := time.NewTicker(w.ProgressInterval)
@@ -42,52 +42,57 @@ func (w *Worker) Run(ctx context.Context) error {
 		default:
 		}
 
-		latest, err := w.Store.LatestBlockNumber(ctx)
-		if err != nil {
-			log.Printf("LatestBlockNumber error: %v", err)
-			time.Sleep(w.IdleDelay)
-			continue
-		}
-		safe := latest - w.ReorgDepth
-		lastB, lastIdx, err := w.Store.GetCheckpoint(ctx, w.WorkerID)
-		if err != nil {
-			log.Printf("GetCheckpoint error: %v", err)
-			time.Sleep(w.IdleDelay)
-			continue
-		}
+        latest, err := w.Store.LatestBlockNumber(ctx)
+        if err != nil {
+            log.Printf("worker: latest block error: %v", err)
+            time.Sleep(w.IdleDelay)
+            continue
+        }
+        safe := latest - w.ReorgDepth
+        lastB, lastIdx, err := w.Store.GetCheckpoint(ctx, w.WorkerID)
+        if err != nil {
+            log.Printf("worker: get checkpoint error: %v", err)
+            time.Sleep(w.IdleDelay)
+            continue
+        }
 
 		// No safe blocks to finalize yet (allow same safe block to continue by log_index)
-		if lastB > safe {
-			log.Printf("idle: checkpoint at safe (cp=%d:%d safe=%d latest=%d); waiting %s", lastB, lastIdx, safe, latest, w.IdleDelay)
-			select {
-			case <-ticker.C:
-				w.roll8h(ctx)
-				w.refreshLeaderboard(ctx)
-			default:
-			}
-			time.Sleep(w.IdleDelay)
-			continue
-		}
+        if lastB > safe {
+            log.Printf("idle-wait: checkpoint at safe (cp=%d:%d safe=%d latest=%d); sleep=%s", lastB, lastIdx, safe, latest, w.IdleDelay)
+            // keep 8h cache fresh even when idle
+            log.Printf("8h-cache: attempt roll (reason=idle-wait) cp=%d:%d safe=%d", lastB, lastIdx, safe)
+            w.roll8h(ctx)
+            select {
+            case <-ticker.C:
+                w.refreshLeaderboard(ctx)
+            default:
+            }
+            time.Sleep(w.IdleDelay)
+            continue
+        }
 
-		t0 := time.Now()
-		newB, newIdx, processed, err := w.Store.AggregateHourlyNextBatch(ctx, lastB, lastIdx, safe, w.BatchSize)
-		if err != nil {
-			log.Printf("AggregateHourlyNextBatch error: %v", err)
-			time.Sleep(w.IdleDelay)
-			continue
-		}
-		pullMs := time.Since(t0).Milliseconds()
-		if processed == 0 {
-			log.Printf("no-rows: within safe bound (cp=%d:%d safe=%d latest=%d); sleeping %s", lastB, lastIdx, safe, latest, w.IdleDelay)
-			select {
-			case <-ticker.C:
-				w.roll8h(ctx)
-			default:
-			}
-			time.Sleep(w.IdleDelay)
-			continue
-		}
-		log.Printf("db-agg: rows=%d in %dms (cp=%d:%d -> %d:%d safe=%d)", processed, pullMs, lastB, lastIdx, newB, newIdx, safe)
+        t0 := time.Now()
+        newB, newIdx, processed, err := w.Store.AggregateHourlyNextBatch(ctx, lastB, lastIdx, safe, w.BatchSize)
+        if err != nil {
+            log.Printf("worker: aggregate batch error: %v", err)
+            time.Sleep(w.IdleDelay)
+            continue
+        }
+        pullMs := time.Since(t0).Milliseconds()
+        if processed == 0 {
+            log.Printf("no-safe-rows: cp=%d:%d safe=%d latest=%d sleep=%s", lastB, lastIdx, safe, latest, w.IdleDelay)
+            // attempt to init/advance 8h cache based on hourly state
+            log.Printf("8h-cache: attempt roll (reason=no-safe-rows) cp=%d:%d safe=%d", lastB, lastIdx, safe)
+            w.roll8h(ctx)
+            select {
+            case <-ticker.C:
+                w.refreshLeaderboard(ctx)
+            default:
+            }
+            time.Sleep(w.IdleDelay)
+            continue
+        }
+        log.Printf("db-aggregate: rows=%d elapsed=%dms cp=%d:%d -> %d:%d safe=%d", processed, pullMs, lastB, lastIdx, newB, newIdx, safe)
 
 		var maxB, maxIdx int64
 		// update counters and checkpoint
@@ -95,10 +100,10 @@ func (w *Worker) Run(ctx context.Context) error {
 		processedSinceReport += processed
 		maxB, maxIdx = newB, newIdx
 		if maxB > 0 {
-			if err := w.Store.SetCheckpoint(ctx, w.WorkerID, maxB, maxIdx); err != nil {
-				log.Printf("SetCheckpoint error: %v", err)
-			}
-		}
+            if err := w.Store.SetCheckpoint(ctx, w.WorkerID, maxB, maxIdx); err != nil {
+                log.Printf("worker: set checkpoint error: %v", err)
+            }
+        }
 		// try to advance 8h window after each batch
 		w.roll8h(ctx)
 		// note: server-side aggregation path doesn't expose per-token min block here.
@@ -159,61 +164,82 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) roll8h(ctx context.Context) {
-	// anchor to the latest processed hour (not ahead of safe)
-	latest, err := w.Store.LatestBlockNumber(ctx)
-	if err != nil {
-		return
-	}
-	safe := latest - w.ReorgDepth
-	safeHour, err := w.Store.LatestSafeHour(ctx, safe)
-	if err != nil || safeHour.IsZero() {
-		return
-	}
-	procHour, err := w.Store.LatestProcessedHour(ctx)
-	if err != nil || procHour.IsZero() {
-		return
-	}
-	if procHour.After(safeHour) {
-		procHour = safeHour
-	}
+    // Advance/init the 8‑hour cache to the latest processed/safe hour.
+    latest, err := w.Store.LatestBlockNumber(ctx)
+    if err != nil {
+        log.Printf("8h-cache: latest block error: %v", err)
+        return
+    }
+    safe := latest - w.ReorgDepth
+    safeHour, err := w.Store.LatestSafeHour(ctx, safe)
+    if err != nil {
+        log.Printf("8h-cache: safe hour error: %v", err)
+        return
+    }
+    if safeHour.IsZero() {
+        log.Printf("8h-cache: safe hour is zero (no blocks?)")
+        return
+    }
+    procHour, err := w.Store.LatestProcessedHour(ctx)
+    if err != nil {
+        log.Printf("8h-cache: processed hour error: %v", err)
+        return
+    }
+    if procHour.IsZero() {
+        // Fallback to safeHour to at least set base_hour; counts may be zero if hourly empty
+        procHour = safeHour
+        log.Printf("8h-cache: no processed hourly yet; fallback to safeHour=%s", safeHour.Format(time.RFC3339))
+    }
+    if procHour.After(safeHour) {
+        procHour = safeHour
+    }
+    log.Printf("8h-cache: state latest=%d safe=%d safeHour=%s procHour=%s", latest, safe, safeHour.Format(time.RFC3339), procHour.Format(time.RFC3339))
 
-	cur, err := w.Store.Get8hCursorHour(ctx)
-	if err != nil {
-		return
-	}
-	if cur.IsZero() {
-		// initialize to processed hour snapshot
-		if err := w.Store.Rebuild8hAtHour(ctx, procHour); err != nil {
-			log.Printf("8h init failed at hour=%s: %v", procHour.Format(time.RFC3339), err)
-			return
-		}
-		// seed points for the last 8 hours [procHour-7h, procHour]
-		for d := 7; d >= 0; d-- {
-			h := procHour.Add(-time.Duration(d) * time.Hour)
-			_ = w.Store.Add8hPointsHour(ctx, h)
-		}
-		_ = w.Store.Set8hCursorHour(ctx, procHour)
-		log.Printf("8h init at hour=%s (points seeded)", procHour.Format(time.RFC3339))
-		return
-	}
-	// advance hour by hour up to safeHour
-	for h := cur.Add(time.Hour); !h.After(procHour); h = h.Add(time.Hour) {
-		// add new hour into points and summary
-		if err := w.Store.Add8hPointsHour(ctx, h); err != nil {
-			break
-		}
-		if err := w.Store.Add8hHour(ctx, h); err != nil {
-			break
-		}
-		// drop hour outside window
-		out := h.Add(-8 * time.Hour)
-		if err := w.Store.Sub8hHour(ctx, out); err != nil {
-			break
-		}
-		_ = w.Store.Sub8hPointsHour(ctx, out)
-		_ = w.Store.Set8hCursorHour(ctx, h)
-		log.Printf("8h rolled to hour=%s (dropped=%s)", h.Format(time.RFC3339), out.Format(time.RFC3339))
-	}
+    cur, err := w.Store.Get8hCursorHour(ctx)
+    if err != nil {
+        log.Printf("8h-cache: get cursor error: %v", err)
+        return
+    }
+    if cur.IsZero() {
+        log.Printf("8h-cache: cursor is unset (init required)")
+    } else {
+        log.Printf("8h-cache: cursor=%s", cur.Format(time.RFC3339))
+    }
+    // If cache table is empty (e.g., legacy cursor remains), force rebuild
+    hasCache, err := w.Store.Has8hCacheData(ctx)
+    if err != nil {
+        log.Printf("8h-cache: check cache error: %v", err)
+    }
+    if !hasCache {
+        log.Printf("8h-cache: empty cache detected — rebuilding at %s", procHour.Format(time.RFC3339))
+        if err := w.Store.Rebuild8hCacheAtHour(ctx, procHour); err != nil {
+            log.Printf("8h-cache: rebuild failed: %v", err)
+            return
+        }
+        _ = w.Store.Set8hCursorHour(ctx, procHour)
+        log.Printf("8h-cache rebuild complete at hour=%s", procHour.Format(time.RFC3339))
+        return
+    }
+    if cur.IsZero() {
+        // initialize 8h cache at processed hour
+        if err := w.Store.Rebuild8hCacheAtHour(ctx, procHour); err != nil {
+            log.Printf("8h-cache init failed at hour=%s: %v", procHour.Format(time.RFC3339), err)
+            return
+        }
+        _ = w.Store.Set8hCursorHour(ctx, procHour)
+        log.Printf("8h-cache init at hour=%s", procHour.Format(time.RFC3339))
+        return
+    }
+    // advance hour by hour up to processed hour
+    if !cur.Before(procHour) {
+        log.Printf("8h-cache: up-to-date (cur=%s, target=%s)", cur.Format(time.RFC3339), procHour.Format(time.RFC3339))
+        return
+    }
+    for h := cur.Add(time.Hour); !h.After(procHour); h = h.Add(time.Hour) {
+        if err := w.Store.Rotate8hCacheToHour(ctx, h); err != nil { break }
+        _ = w.Store.Set8hCursorHour(ctx, h)
+        log.Printf("8h-cache advance: hour=%s", h.Format(time.RFC3339))
+    }
 }
 
 func (w *Worker) refreshLeaderboard(ctx context.Context) {

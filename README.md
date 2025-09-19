@@ -1,94 +1,55 @@
-Overview
+Token Analytics — 8h Leaderboard and Series
 
-Token transfers analytics with a worker + API gateway.
-Implements:
-- Token TXs leaderboard (rolling 8h), cached in Redis with exact-SQL fallback.
-- Hourly series per token backed by a materialized aggregate table.
+1) What it provides
+- Services
+  - REST API
+    - GET `/tokens/top?limit=100` — 8h leaderboard with token metadata
+    - GET `/tokens/{token}/txs/8h` — last 8 hourly points for a token
+    - GET `/tokens/{token}/metadata` — token info (name, symbol, decimals, total_supply)
+  - Web UI
+    - `/` — Leaderboard (single column with rank, token, bar, 8h txs)
+    - `/token.html?address=0x...` — Token page (8h line chart + metadata, Etherscan link)
+- Implementation
+  - Analysis worker ingests `token_transfers`, writes hourly aggregates (`token_transfer_hourly`), and maintains two materialized 8h tables:
+    - `token_transfer_8hour_points` — per‑token 8 buckets (one per hour), derived from hourly
+    - `token_transfer_8hour` — per‑token rolling sum over last 8 hours, derived from the points table
+  - Worker refreshes a Redis cache for the leaderboard (JSON + window times)
+  - Optional metadata worker fetches ERC20 info via RPC and stores into `token_metadata`
 
-Data source: Postgres with tables blocks, logs, token_transfers, transactions.
-Optional: Erigon RPC (not required for this implementation).
+2) Requirements
+- Runtime
+  - Go 1.21+
+  - Postgres 13+ with these source tables populated: `blocks`, `token_transfers` (and `logs`, `transactions` if present)
+  - Redis (for leaderboard cache)
+  - Optional Ethereum JSON‑RPC (for metadata worker)
+- Database schema
+  - Apply project migrations in order (see Run → Migrations)
+- Indexing
+  - A covering index on `token_transfers` is included to accelerate incremental scans:
+    - `CREATE INDEX idx_tt_block_log_inc ON token_transfers (block_number, log_index) INCLUDE (block_timestamp, token_address);`
 
-Project Layout
-- cmd/analysis-worker: incremental aggregator + leaderboard refresher
-- cmd/api-gateway: REST API server
-- internal/config: env-based config
-- internal/store: Postgres store and queries
-- internal/cache: Redis cache for leaderboard
-- internal/aggregator: worker loop
-- internal/api: HTTP handlers
-- internal/models: DTOs
-- internal/mock: mock store/cache for tests
-- migrations: DDL for aggregates and indexes
-
-Migrations (SQL)
-Run migrations in Postgres before starting services:
-
+3) How to run
+- Migrations
   psql "$PG_DSN" -f migrations/001_init.sql
-  psql "$PG_DSN" -f migrations/003_token_transfer_8hour.sql
-  psql "$PG_DSN" -f migrations/004_token_transfer_8hour_points.sql
+  psql "$PG_DSN" -f migrations/002_token_metadata.sql
   psql "$PG_DSN" -f migrations/005_idx_cover_next_transfers.sql
+  psql "$PG_DSN" -f migrations/006_token_8h_cache.sql
 
-Environment
-- PG_DSN: postgres://user:pass@localhost:5432/db?sslmode=disable
-- REDIS_ADDR: 127.0.0.1:6379
-- REDIS_DB: 0
+- Analysis worker (aggregates + 8h roller + Redis refresh)
+  BATCH_SIZE=20000 REORG_DEPTH=12 PG_DSN=postgres://user:pass@host:5432/db?sslmode=disable \
+  REDIS_ADDR=127.0.0.1:6379 go run ./cmd/analysis-worker
 
-Worker (analysis-worker)
-- BATCH_SIZE: default 2000
-- REORG_DEPTH: default 12
-- IDLE_DELAY: default 3s
-- LEADERBOARD_INTERVAL: default 60s
-- LEADERBOARD_SIZE: default 100
-- RPC_URL: default http://127.0.0.1:8545 (用于补齐缺失的 ERC20 元数据)
-- PROGRESS_LOG_INTERVAL: default 15s（进度日志打印间隔）
+- API gateway (serves API + web UI)
+  PG_DSN=postgres://user:pass@host:5432/db?sslmode=disable REDIS_ADDR=127.0.0.1:6379 \
+  API_ADDR=:8080 go run ./cmd/api-gateway
+  Open http://localhost:8080/
 
-API (api-gateway)
-- API_ADDR: default :8080
-
-Run
-1) Apply migrations
-2) Start worker
-
-  go run ./cmd/analysis-worker
-
-3) Start API
-
-  go run ./cmd/api-gateway
-
-API Endpoints
-- GET /tokens/top?limit=100
-  - 仅返回能查到 symbol 的 ERC20 代币
-  - Response: {"window": {"from":"...","to":"..."}, "tokens":[{"token_address":"0x..","name":"","symbol":"","decimals":18,"total_supply":"...","txs_count":123}]}
-
-- GET /tokens/{token}/txs/8h
-  - 直接返回最近 8 小时的每小时桶（来自 token_transfer_8hour_points）
-  - Response: {"token_address":"0x..","points":[{"hour":"...","txs_count":12}]}
-
-- GET /tokens/{token}/metadata
-  Response: {"token_address":"0x..","name":"","symbol":"","decimals":18,"total_supply":"...","first_seen_block":0,"updated_at":"..."}
+- (Optional) Metadata worker (fill token_metadata via RPC)
+  RPC_URL=http://127.0.0.1:8545 PG_DSN=postgres://user:pass@host:5432/db?sslmode=disable \
+  go run ./cmd/metadata-worker
 
 Notes
-- Leaderboard uses Redis ZSET key leaderboard:8h and stores window unix seconds in leaderboard:8h:{from,to}.
-- Exact rolling 8h counts come from token_transfers (COUNT(*)), not distinct transactions.
-- Hourly aggregates are upserted by the worker from token_transfers.block_timestamp.
-- Worker 同步 hourly 时会：
-  - 确保 token_metadata 存在并更新 first_seen_block（取最小值）
-  - 若该 token 元数据缺失（name/symbol/decimals/total_supply 为空），将通过本地 RPC 获取并回写（不会覆盖已有非空字段）。在非合约地址或合约返回 revert 时跳过，并按间隔重试。
-  - 周期性打印同步进度：checkpoint、安全区块、落后区块数、累计/最近处理速率
-
-8-hour Materialized Window
-- Table: `token_transfer_8hour` holds rolling sums per token for the last 8 hours.
-- Table: `token_transfer_8hour_points` holds per-token per-hour buckets for the last 8 hours.
-- Maintained by the worker via hourly roll-forward using `token_transfer_hourly`:
-  - On each hour advancement to safe hour H: add counts for H; subtract counts for H-8h.
-  - Points table：插入 H 小时，删除 H-8h 小时。
-  - Initial bootstrap builds sums for [H-7h, H].
-- API `/tokens/top` reads from `token_transfer_8hour` (LEFT JOIN token_metadata, filter symbol present), so queries are fast and stable.
-
-Metadata
-- Table: token_metadata (address, name, symbol, decimals, total_supply, first_seen_block, updated_at)
-- 由 worker 在缺失时自动补齐（依赖 RPC_URL），也可由外部流程补充或修正。
-- 初始化地址集（可选）：
-  INSERT INTO token_metadata (token_address)
-  SELECT DISTINCT token_address FROM token_transfer_hourly
-  ON CONFLICT (token_address) DO NOTHING;
+- The worker aggregates on the DB side (LIMIT → GROUP BY (token,hour) → UPSERT) and processes only up to `safe = latest − REORG_DEPTH`.
+- When the checkpoint block equals `safe`, it still finishes that block by `log_index`.
+- The 8h tables are updated after each batch and on a periodic ticker; first init seeds both summary and points.
+- If you backfill historical rows below the current checkpoint, recompute those hours (DELETE+INSERT for that hour) or add a background self‑heal task.

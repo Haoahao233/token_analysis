@@ -217,11 +217,8 @@ func (m *MockStore) EnsureTokenMetadataRow(ctx context.Context, token string, fi
 func (m *MockStore) Get8hCursorHour(ctx context.Context) (time.Time, error) { return time.Time{}, nil }
 func (m *MockStore) Set8hCursorHour(ctx context.Context, hour time.Time) error { return nil }
 func (m *MockStore) LatestSafeHour(ctx context.Context, safeBlock int64) (time.Time, error) { return time.Now().UTC().Truncate(time.Hour), nil }
-func (m *MockStore) Add8hHour(ctx context.Context, hour time.Time) error { return nil }
-func (m *MockStore) Sub8hHour(ctx context.Context, hour time.Time) error { return nil }
-func (m *MockStore) Rebuild8hAtHour(ctx context.Context, hour time.Time) error { return nil }
-func (m *MockStore) Add8hPointsHour(ctx context.Context, hour time.Time) error { return nil }
-func (m *MockStore) Sub8hPointsHour(ctx context.Context, hour time.Time) error { return nil }
+func (m *MockStore) Rebuild8hCacheAtHour(ctx context.Context, hour time.Time) error { return nil }
+func (m *MockStore) Rotate8hCacheToHour(ctx context.Context, hour time.Time) error { return nil }
 func (m *MockStore) Series8h(ctx context.Context, token string) ([]models.HourPoint, error) { return nil, nil }
 func (m *MockStore) AggregateHourlyNextBatch(ctx context.Context, lastBlock, lastLogIdx, maxBlock int64, limit int) (int64, int64, int64, error) {
     // no-op mock returning unchanged cursor
